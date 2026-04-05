@@ -35,109 +35,112 @@ setInterval(() => {
 
 // ─── MHT Parsing ─────────────────────────────────────────────────────────────
 
-function decodeQuotedPrintable(input: string): Buffer {
-  const decoded = input
-    .replace(/=\r\n/g, "")
-    .replace(/=\n/g, "")
-    .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-  return Buffer.from(decoded, "binary");
+interface ImagePart {
+  buffer: Buffer;
+  location: string;   // Content-Location URL
+  sortKey: number;    // numeric page number from filename, or Infinity
 }
 
 async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
-  // Try UTF-8 first, fall back to latin1 (binary)
-  const raw = mhtContent.toString("binary");
-
-  // Find the boundary – it can appear as:
-  //   boundary="some-string" or boundary=some-string (no quotes)
-  const boundaryMatch = raw.match(/boundary=(?:"([^"]+)"|([^\s;]+))/i);
+  // Read header to find boundary
+  const headerSlice = mhtContent.slice(0, 4096).toString("utf8");
+  const boundaryMatch = headerSlice.match(/boundary=(?:"([^"]+)"|([^\s;\r\n]+))/i);
   if (!boundaryMatch) throw new Error("MIME boundary not found in .mht file");
   const boundary = (boundaryMatch[1] ?? boundaryMatch[2]).trim();
 
   logger.info({ boundary }, "Parsed MIME boundary");
 
-  // Split the file into MIME parts
-  // Parts are delimited by "--boundary" (may have \r\n or \n)
-  // We split on the literal delimiter line
-  const delimiter = "--" + boundary;
-  const parts = raw.split(new RegExp(delimiter + "(?:\r\n|\n|$)", "g"));
+  // Work at Buffer level — no toString("binary") on the whole file
+  const delim = Buffer.from("--" + boundary);
+  const CRLF_CRLF = Buffer.from("\r\n\r\n");
+  const LF_LF = Buffer.from("\n\n");
 
-  logger.info({ totalParts: parts.length }, "Split into MIME parts");
+  // Collect start positions of every delimiter occurrence
+  const positions: number[] = [];
+  let pos = 0;
+  while (pos < mhtContent.length) {
+    const idx = mhtContent.indexOf(delim, pos);
+    if (idx === -1) break;
+    positions.push(idx);
+    pos = idx + delim.length;
+  }
+  logger.info({ delimCount: positions.length }, "Found delimiter positions");
 
-  const images: Buffer[] = [];
+  const imageParts: ImagePart[] = [];
 
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (!part || part.trim() === "--" || part.trim() === "") continue;
+  for (let i = 0; i < positions.length; i++) {
+    const partStart = positions[i] + delim.length;
+    const partEnd = i + 1 < positions.length ? positions[i + 1] : mhtContent.length;
+    const part = mhtContent.slice(partStart, partEnd);
 
-    // Separate headers from body at the first blank line
-    const blankLineIdx = part.search(/\r?\n\r?\n/);
-    if (blankLineIdx === -1) continue;
+    // Find headers/body separator (\r\n\r\n first, then \n\n)
+    let sepIdx = part.indexOf(CRLF_CRLF);
+    let sepLen = 4;
+    if (sepIdx === -1) { sepIdx = part.indexOf(LF_LF); sepLen = 2; }
+    if (sepIdx === -1) continue;
 
-    const headerSection = part.slice(0, blankLineIdx);
-    // Body is everything after the blank line; strip any trailing boundary/whitespace
-    let body = part.slice(blankLineIdx).replace(/^\r?\n\r?\n/, "");
+    const headerStr = part.slice(0, sepIdx).toString("utf8");
 
-    // Remove trailing "--" or whitespace (end-of-part marker)
-    body = body.replace(/\r?\n?--\s*$/, "").replace(/\s+$/, "");
+    // Skip non-image parts immediately
+    if (!/content-type:\s*image\//i.test(headerStr)) continue;
 
     // Parse headers
     const headers: Record<string, string> = {};
-    for (const line of headerSection.split(/\r?\n/)) {
-      const colonIdx = line.indexOf(":");
-      if (colonIdx === -1) continue;
-      const key = line.slice(0, colonIdx).trim().toLowerCase();
-      const value = line.slice(colonIdx + 1).trim();
-      headers[key] = value;
+    for (const line of headerStr.split(/\r?\n/)) {
+      const ci = line.indexOf(":");
+      if (ci === -1) continue;
+      headers[line.slice(0, ci).trim().toLowerCase()] = line.slice(ci + 1).trim();
     }
 
-    const contentType = headers["content-type"] ?? "";
-    const isImage = /^image\//i.test(contentType);
-    if (!isImage) continue;
-
-    const mimeType = contentType.split(";")[0].trim().toLowerCase();
     const encoding = (headers["content-transfer-encoding"] ?? "base64").trim().toLowerCase();
-
-    logger.info({ part: i, mimeType, encoding, bodyLen: body.length }, "Found image part");
+    const location = headers["content-location"] ?? "";
+    const bodyBuf = part.slice(sepIdx + sepLen);
 
     try {
       let imgBuffer: Buffer;
-
       if (encoding === "base64") {
-        // Remove ALL whitespace (line breaks included) before decoding
-        const cleanB64 = body.replace(/\s/g, "");
-        if (cleanB64.length === 0) {
-          logger.warn({ part: i }, "Empty base64 body, skipping");
-          continue;
-        }
-        imgBuffer = Buffer.from(cleanB64, "base64");
+        // bodyBuf is ASCII base64 with CRLF line breaks — decode at buffer level
+        const b64str = bodyBuf.toString("ascii").replace(/\s/g, "");
+        if (b64str.length < 10) continue;
+        imgBuffer = Buffer.from(b64str, "base64");
       } else if (encoding === "quoted-printable") {
-        imgBuffer = decodeQuotedPrintable(body);
+        const decoded = bodyBuf.toString("binary")
+          .replace(/=\r\n/g, "").replace(/=\n/g, "")
+          .replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+        imgBuffer = Buffer.from(decoded, "binary");
       } else {
-        // 8bit / binary / 7bit
-        imgBuffer = Buffer.from(body, "binary");
+        imgBuffer = Buffer.from(bodyBuf);
       }
 
-      if (imgBuffer.length < 100) {
-        logger.warn({ part: i, size: imgBuffer.length }, "Image buffer too small, skipping");
-        continue;
-      }
+      if (imgBuffer.length < 200) continue; // skip tiny/broken images
 
-      // Validate with sharp (non-strict: just check it doesn't throw)
+      // Validate dimensions
       const meta = await sharp(imgBuffer).metadata();
-      if (!meta.width || !meta.height) {
-        logger.warn({ part: i }, "sharp: no dimensions, skipping");
-        continue;
-      }
+      if (!meta.width || !meta.height) continue;
+      if (meta.width < 50 || meta.height < 50) continue; // skip icons/tiny UI elements
 
-      logger.info({ part: i, width: meta.width, height: meta.height }, "Valid image");
-      images.push(imgBuffer);
+      // Extract numeric sort key from URL filename  e.g. ".../35.jpg" → 35
+      const fnMatch = location.match(/\/(\d+)\.\w+(?:\?.*)?$/);
+      const sortKey = fnMatch ? parseInt(fnMatch[1], 10) : Infinity;
+
+      logger.info({ location, sortKey, width: meta.width, height: meta.height }, "Valid image part");
+      imageParts.push({ buffer: imgBuffer, location, sortKey });
     } catch (err) {
-      logger.warn({ part: i, err }, "Failed to decode/validate image part, skipping");
+      logger.warn({ location, err: String(err) }, "Skipping image part");
     }
   }
 
-  logger.info({ imageCount: images.length }, "Extraction complete");
-  return images;
+  // Sort: numeric filenames first (ascending page order), then non-numeric in original order
+  const numericParts = imageParts.filter(p => p.sortKey !== Infinity).sort((a, b) => a.sortKey - b.sortKey);
+  const nonNumericParts = imageParts.filter(p => p.sortKey === Infinity);
+  const sorted = [...numericParts, ...nonNumericParts];
+
+  logger.info(
+    { total: sorted.length, numeric: numericParts.length, nonNumeric: nonNumericParts.length },
+    "Extraction complete — sorted by page number"
+  );
+
+  return sorted.map(p => p.buffer);
 }
 
 // ─── PDF ─────────────────────────────────────────────────────────────────────
