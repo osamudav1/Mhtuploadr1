@@ -5,11 +5,8 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { execFile } from "child_process";
-import { promisify } from "util";
+import { spawn } from "child_process";
 import { logger } from "./lib/logger";
-
-const execFileAsync = promisify(execFile);
 
 const token = process.env["TELEGRAM_BOT_TOKEN"];
 if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");
@@ -22,7 +19,59 @@ function isOwner(userId: number | undefined): boolean {
   return userId === OWNER_ID;
 }
 
-// Store pending file info waiting for user's choice
+// ─── Cancellation ─────────────────────────────────────────────────────────────
+
+class JobCancelledError extends Error {
+  constructor() { super("CANCELLED"); this.name = "JobCancelledError"; }
+}
+
+class CancelToken {
+  cancelled = false;
+  private abortController = new AbortController();
+  private childKill: (() => void) | null = null;
+
+  get signal() { return this.abortController.signal; }
+
+  registerChild(kill: () => void) { this.childKill = kill; }
+  unregisterChild() { this.childKill = null; }
+
+  cancel() {
+    this.cancelled = true;
+    this.abortController.abort();
+    try { this.childKill?.(); } catch { /* ignore */ }
+  }
+
+  throwIfCancelled() {
+    if (this.cancelled) throw new JobCancelledError();
+  }
+}
+
+// One active job per chatId
+const activeJobs = new Map<number, CancelToken>();
+
+function cancelExistingJob(chatId: number): boolean {
+  const existing = activeJobs.get(chatId);
+  if (existing) {
+    existing.cancel();
+    activeJobs.delete(chatId);
+    return true;
+  }
+  return false;
+}
+
+function startJob(chatId: number): CancelToken {
+  cancelExistingJob(chatId);
+  const token = new CancelToken();
+  activeJobs.set(chatId, token);
+  return token;
+}
+
+function finishJob(chatId: number, token: CancelToken) {
+  if (activeJobs.get(chatId) === token) activeJobs.delete(chatId);
+}
+
+// ─── Pending files (MHT choice keyboard) ─────────────────────────────────────
+
 interface PendingFile {
   fileId: string;
   fileName: string;
@@ -41,12 +90,11 @@ setInterval(() => {
 
 interface ImagePart {
   buffer: Buffer;
-  location: string;   // Content-Location URL
-  sortKey: number;    // numeric page number from filename, or Infinity
+  location: string;
+  sortKey: number;
 }
 
-async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
-  // Read header to find boundary
+async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promise<Buffer[]> {
   const headerSlice = mhtContent.slice(0, 4096).toString("utf8");
   const boundaryMatch = headerSlice.match(/boundary=(?:"([^"]+)"|([^\s;\r\n]+))/i);
   if (!boundaryMatch) throw new Error("MIME boundary not found in .mht file");
@@ -54,12 +102,10 @@ async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
 
   logger.info({ boundary }, "Parsed MIME boundary");
 
-  // Work at Buffer level — no toString("binary") on the whole file
   const delim = Buffer.from("--" + boundary);
   const CRLF_CRLF = Buffer.from("\r\n\r\n");
   const LF_LF = Buffer.from("\n\n");
 
-  // Collect start positions of every delimiter occurrence
   const positions: number[] = [];
   let pos = 0;
   while (pos < mhtContent.length) {
@@ -68,27 +114,24 @@ async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
     positions.push(idx);
     pos = idx + delim.length;
   }
-  logger.info({ delimCount: positions.length }, "Found delimiter positions");
 
   const imageParts: ImagePart[] = [];
 
   for (let i = 0; i < positions.length; i++) {
+    ct.throwIfCancelled();
+
     const partStart = positions[i] + delim.length;
     const partEnd = i + 1 < positions.length ? positions[i + 1] : mhtContent.length;
     const part = mhtContent.slice(partStart, partEnd);
 
-    // Find headers/body separator (\r\n\r\n first, then \n\n)
     let sepIdx = part.indexOf(CRLF_CRLF);
     let sepLen = 4;
     if (sepIdx === -1) { sepIdx = part.indexOf(LF_LF); sepLen = 2; }
     if (sepIdx === -1) continue;
 
     const headerStr = part.slice(0, sepIdx).toString("utf8");
-
-    // Skip non-image parts immediately
     if (!/content-type:\s*image\//i.test(headerStr)) continue;
 
-    // Parse headers
     const headers: Record<string, string> = {};
     for (const line of headerStr.split(/\r?\n/)) {
       const ci = line.indexOf(":");
@@ -103,7 +146,6 @@ async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
     try {
       let imgBuffer: Buffer;
       if (encoding === "base64") {
-        // bodyBuf is ASCII base64 with CRLF line breaks — decode at buffer level
         const b64str = bodyBuf.toString("ascii").replace(/\s/g, "");
         if (b64str.length < 10) continue;
         imgBuffer = Buffer.from(b64str, "base64");
@@ -116,60 +158,78 @@ async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
         imgBuffer = Buffer.from(bodyBuf);
       }
 
-      if (imgBuffer.length < 200) continue; // skip tiny/broken images
+      if (imgBuffer.length < 200) continue;
 
-      // Validate dimensions
       const meta = await sharp(imgBuffer).metadata();
       if (!meta.width || !meta.height) continue;
-      if (meta.width < 50 || meta.height < 50) continue; // skip icons/tiny UI elements
+      if (meta.width < 50 || meta.height < 50) continue;
 
-      // Extract numeric sort key from URL filename  e.g. ".../35.jpg" → 35
       const fnMatch = location.match(/\/(\d+)\.\w+(?:\?.*)?$/);
       const sortKey = fnMatch ? parseInt(fnMatch[1], 10) : Infinity;
 
-      logger.info({ location, sortKey, width: meta.width, height: meta.height }, "Valid image part");
       imageParts.push({ buffer: imgBuffer, location, sortKey });
     } catch (err) {
       logger.warn({ location, err: String(err) }, "Skipping image part");
     }
   }
 
-  // Sort: numeric filenames first (ascending page order), then non-numeric in original order
   const numericParts = imageParts.filter(p => p.sortKey !== Infinity).sort((a, b) => a.sortKey - b.sortKey);
   const nonNumericParts = imageParts.filter(p => p.sortKey === Infinity);
   const sorted = [...numericParts, ...nonNumericParts];
 
-  logger.info(
-    { total: sorted.length, numeric: numericParts.length, nonNumeric: nonNumericParts.length },
-    "Extraction complete — sorted by page number"
-  );
-
+  logger.info({ total: sorted.length }, "MHT extraction complete");
   return sorted.map(p => p.buffer);
 }
 
 // ─── PDF → Images (pdftoppm) ──────────────────────────────────────────────────
 
-async function extractImagesFromPdf(pdfBuffer: Buffer): Promise<Buffer[]> {
+async function extractImagesFromPdf(pdfBuffer: Buffer, ct: CancelToken): Promise<Buffer[]> {
+  ct.throwIfCancelled();
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pdf_"));
   const pdfPath = path.join(tmpDir, "input.pdf");
   const outPrefix = path.join(tmpDir, "page");
 
   try {
     fs.writeFileSync(pdfPath, pdfBuffer);
+    ct.throwIfCancelled();
 
-    // pdftoppm converts each page to a PNG image  (output: page-001.png, page-002.png, ...)
-    await execFileAsync("pdftoppm", ["-r", "200", "-png", pdfPath, outPrefix]);
+    // Run pdftoppm as a spawned child so we can kill it on cancel
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("pdftoppm", ["-r", "200", "-png", pdfPath, outPrefix]);
+
+      ct.registerChild(() => {
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      });
+
+      let stderr = "";
+      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+      child.on("close", (code) => {
+        ct.unregisterChild();
+        if (ct.cancelled) { reject(new JobCancelledError()); return; }
+        if (code !== 0) reject(new Error(`pdftoppm failed (code ${code}): ${stderr.trim()}`));
+        else resolve();
+      });
+
+      child.on("error", (err) => {
+        ct.unregisterChild();
+        reject(err);
+      });
+    });
+
+    ct.throwIfCancelled();
 
     const files = fs.readdirSync(tmpDir)
       .filter(f => f.startsWith("page") && f.endsWith(".png"))
-      .sort(); // pdftoppm names them with zero-padded numbers → lexicographic sort is correct
+      .sort();
 
     logger.info({ pageCount: files.length }, "PDF pages extracted");
 
     const buffers: Buffer[] = [];
     for (const file of files) {
-      const imgBuf = fs.readFileSync(path.join(tmpDir, file));
-      buffers.push(imgBuf);
+      ct.throwIfCancelled();
+      buffers.push(fs.readFileSync(path.join(tmpDir, file)));
     }
     return buffers;
   } finally {
@@ -179,7 +239,7 @@ async function extractImagesFromPdf(pdfBuffer: Buffer): Promise<Buffer[]> {
 
 // ─── PDF creation ─────────────────────────────────────────────────────────────
 
-async function createPdfFromImages(images: Buffer[]): Promise<string> {
+async function createPdfFromImages(images: Buffer[], ct: CancelToken): Promise<string> {
   const pdfPath = path.join(os.tmpdir(), `manga_${Date.now()}.pdf`);
   return new Promise(async (resolve, reject) => {
     try {
@@ -188,6 +248,7 @@ async function createPdfFromImages(images: Buffer[]): Promise<string> {
       doc.pipe(ws);
 
       for (const imgBuffer of images) {
+        ct.throwIfCancelled();
         const meta = await sharp(imgBuffer).metadata();
         const w = meta.width ?? 595;
         const h = meta.height ?? 842;
@@ -205,24 +266,25 @@ async function createPdfFromImages(images: Buffer[]): Promise<string> {
   });
 }
 
-// ─── Media Group (images direct) ─────────────────────────────────────────────
+// ─── Media Groups ─────────────────────────────────────────────────────────────
 
 async function sendImagesAsMediaGroups(
   chatId: number,
   images: Buffer[],
   baseName: string,
-  statusMsgId: number
+  statusMsgId: number,
+  ct: CancelToken
 ): Promise<void> {
   const tmpDir = os.tmpdir();
   const tempFiles: string[] = [];
 
   try {
-    // Save all images as JPEG temp files in ORDER
     for (let i = 0; i < images.length; i++) {
+      ct.throwIfCancelled();
       const imgPath = path.join(tmpDir, `img_${Date.now()}_${String(i).padStart(5, "0")}.jpg`);
       await sharp(images[i])
         .jpeg({ quality: 90 })
-        .resize({ width: 2048, withoutEnlargement: true }) // keep under Telegram limits
+        .resize({ width: 2048, withoutEnlargement: true })
         .toFile(imgPath);
       tempFiles.push(imgPath);
     }
@@ -231,11 +293,12 @@ async function sendImagesAsMediaGroups(
     const totalGroups = Math.ceil(images.length / groupSize);
 
     for (let g = 0; g < totalGroups; g++) {
+      ct.throwIfCancelled();
+
       const start = g * groupSize;
       const end = Math.min(start + groupSize, images.length);
       const groupFiles = tempFiles.slice(start, end);
 
-      // Update status
       await bot.editMessageText(
         `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
         { chat_id: chatId, message_id: statusMsgId }
@@ -251,9 +314,12 @@ async function sendImagesAsMediaGroups(
 
       await bot.sendMediaGroup(chatId, media);
 
-      // Respect Telegram flood limits between groups
       if (g < totalGroups - 1) {
-        await new Promise((res) => setTimeout(res, 1500));
+        await new Promise<void>((res, rej) => {
+          const t = setTimeout(res, 1500);
+          // Allow cancel to interrupt the delay
+          ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
+        }).finally(() => ct.unregisterChild());
       }
     }
   } finally {
@@ -263,34 +329,30 @@ async function sendImagesAsMediaGroups(
   }
 }
 
-// ─── Helper: download + extract ──────────────────────────────────────────────
+// ─── Download helper ──────────────────────────────────────────────────────────
 
-async function downloadAndExtract(
+async function downloadFile(
   fileId: string,
   fileName: string,
   chatId: number,
-  statusMsgId: number
-): Promise<Buffer[]> {
+  statusMsgId: number,
+  ct: CancelToken
+): Promise<Buffer> {
+  ct.throwIfCancelled();
   await bot.editMessageText(
     `⏳ "${fileName}"\nဖိုင် ဒေါင်းလုပ် ဆွဲနေသည်...`,
     { chat_id: chatId, message_id: statusMsgId }
   );
 
   const fileLink = await bot.getFileLink(fileId);
-  logger.info({ fileName }, "Downloading .mht file");
+  ct.throwIfCancelled();
 
   const response = await axios.get(fileLink, {
     responseType: "arraybuffer",
-    maxContentLength: 100 * 1024 * 1024, // 100 MB
+    maxContentLength: 100 * 1024 * 1024,
+    signal: ct.signal,
   });
-  const mhtBuffer = Buffer.from(response.data);
-
-  await bot.editMessageText(
-    `⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`,
-    { chat_id: chatId, message_id: statusMsgId }
-  );
-
-  return extractImagesFromMht(mhtBuffer);
+  return Buffer.from(response.data);
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -303,7 +365,8 @@ bot.onText(/\/start/, (msg) => {
       `ဖိုင် ၂ မျိုး လက်ခံသည်:\n\n` +
       `📄 .pdf ဖိုင် → ပုံများ တိုက်ရိုက် (10 ပုံစီ) ပို့ပေးသည်\n` +
       `🗂 .mht / .mhtml ဖိုင် → PDF သို့မဟုတ် ပုံများ ရွေးချယ်နိုင်သည်\n\n` +
-      `ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ။`
+      `ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ။\n\n` +
+      `/cancel — လုပ်ဆောင်နေသော task ကို ဖျက်ရန်`
   );
 });
 
@@ -314,12 +377,25 @@ bot.onText(/\/help/, (msg) => {
     `📖 အသုံးပြုနည်း:\n\n` +
       `【 PDF ဖိုင် 】\n` +
       `• .pdf ဖိုင် Document ပို့ပါ\n` +
-      `• Bot က အလိုအလျောက် စာမျက်နှာ တစ်မျက်နှာချင်း ပုံများအဖြစ် (10 ပုံစီ) ပို့မည်\n\n` +
+      `• Bot က အလိုအလျောက် 10 ပုံစီ media group ပို့မည်\n\n` +
       `【 MHT ဖိုင် 】\n` +
       `• .mht / .mhtml ဖိုင် Document ပို့ပါ\n` +
       `• PDF အဖြစ် ပြောင်းပို့ (သို့) ပုံများ တိုက်ရိုက် ပို့ ရွေးနိုင်သည်\n\n` +
+      `/cancel — လုပ်ဆောင်နေသော task ကို ဖျက်ရန်\n\n` +
       `⚠️ မှတ်ချက်: ဖိုင်ကို Photo မဟုတ်ဘဲ Document အဖြစ် ပို့ပါ`
   );
+});
+
+bot.onText(/\/cancel/, async (msg) => {
+  if (!isOwner(msg.from?.id)) return;
+  const chatId = msg.chat.id;
+  const wasRunning = cancelExistingJob(chatId);
+  pendingFiles.delete(chatId);
+  if (wasRunning) {
+    bot.sendMessage(chatId, "🛑 လုပ်ဆောင်နေသော task ကို ဖျက်လိုက်ပြီ။");
+  } else {
+    bot.sendMessage(chatId, "⚠️ ဖျက်စရာ task မရှိပါ။");
+  }
 });
 
 // ─── Document Handler ────────────────────────────────────────────────────────
@@ -343,29 +419,22 @@ bot.on("document", async (msg) => {
     lowerName.endsWith(".pdf") ||
     document.mime_type === "application/pdf";
 
-  // ── PDF: download immediately and send as media groups ──
+  // ── PDF ──────────────────────────────────────────────────────────────────────
   if (isPdf) {
+    // Cancel any running job and start fresh
+    const ct = startJob(chatId);
     const statusMsg = await bot.sendMessage(chatId, `⏳ "${fileName}" ကို လုပ်ဆောင်နေသည်...`);
     const statusMsgId = statusMsg.message_id;
     const baseName = path.basename(fileName, ".pdf");
 
     try {
-      await bot.editMessageText(`⏳ "${fileName}"\nဖိုင် ဒေါင်းလုပ် ဆွဲနေသည်...`, {
-        chat_id: chatId, message_id: statusMsgId,
-      });
-
-      const fileLink = await bot.getFileLink(document.file_id);
-      const response = await axios.get(fileLink, {
-        responseType: "arraybuffer",
-        maxContentLength: 100 * 1024 * 1024,
-      });
-      const pdfBuffer = Buffer.from(response.data);
+      const pdfBuffer = await downloadFile(document.file_id, fileName, chatId, statusMsgId, ct);
 
       await bot.editMessageText(`⏳ PDF ဖိုင်မှ ပုံများ ထုတ်နေသည်...`, {
         chat_id: chatId, message_id: statusMsgId,
       });
 
-      const images = await extractImagesFromPdf(pdfBuffer);
+      const images = await extractImagesFromPdf(pdfBuffer, ct);
 
       if (images.length === 0) {
         await bot.editMessageText(`❌ PDF ထဲတွင် ပုံများ မတွေ့ပါ။`, {
@@ -380,25 +449,34 @@ bot.on("document", async (msg) => {
         { chat_id: chatId, message_id: statusMsgId }
       );
 
-      await sendImagesAsMediaGroups(chatId, images, baseName, statusMsgId);
-      await bot.deleteMessage(chatId, statusMsgId);
+      await sendImagesAsMediaGroups(chatId, images, baseName, statusMsgId, ct);
+      await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
       logger.info({ chatId, fileName, pageCount: images.length }, "PDF pages sent as media groups");
     } catch (err) {
-      logger.error({ err, chatId, fileName }, "PDF processing error");
-      bot.editMessageText(
-        `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
-        { chat_id: chatId, message_id: statusMsgId }
-      ).catch(() => bot.sendMessage(chatId, "❌ PDF လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+      if (err instanceof JobCancelledError) {
+        bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: statusMsgId })
+          .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
+      } else {
+        logger.error({ err, chatId, fileName }, "PDF processing error");
+        bot.editMessageText(
+          `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
+          { chat_id: chatId, message_id: statusMsgId }
+        ).catch(() => bot.sendMessage(chatId, "❌ PDF လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+      }
+    } finally {
+      finishJob(chatId, ct);
     }
     return;
   }
 
-  // ── MHT: show choice keyboard ──
+  // ── MHT ──────────────────────────────────────────────────────────────────────
   if (!isMht) {
     bot.sendMessage(chatId, `❌ .mht / .mhtml / .pdf ဖိုင်သာ လက်ခံသည်။\nပေးပို့သော ဖိုင်: ${fileName}`);
     return;
   }
 
+  // Cancel any running job before showing the keyboard
+  cancelExistingJob(chatId);
   pendingFiles.set(chatId, { fileId: document.file_id, fileName, timestamp: Date.now() });
 
   await bot.sendMessage(
@@ -439,7 +517,9 @@ bot.on("callback_query", async (query) => {
   const { fileId, fileName } = pending;
   const baseName = path.basename(fileName, path.extname(fileName));
 
-  // ── PDF ──
+  const ct = startJob(chatId);
+
+  // ── MHT → PDF ────────────────────────────────────────────────────────────────
   if (action === "send_pdf") {
     await bot.editMessageText(`⏳ "${fileName}" ကို လုပ်ဆောင်နေသည်...`, {
       chat_id: chatId, message_id: messageId,
@@ -447,7 +527,13 @@ bot.on("callback_query", async (query) => {
 
     let pdfPath: string | null = null;
     try {
-      const images = await downloadAndExtract(fileId, fileName, chatId, messageId);
+      const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct);
+
+      await bot.editMessageText(`⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
+        chat_id: chatId, message_id: messageId,
+      });
+
+      const images = await extractImagesFromMht(mhtBuffer, ct);
 
       if (images.length === 0) {
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
@@ -459,7 +545,7 @@ bot.on("callback_query", async (query) => {
         { chat_id: chatId, message_id: messageId }
       );
 
-      pdfPath = await createPdfFromImages(images);
+      pdfPath = await createPdfFromImages(images, ct);
 
       await bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: messageId });
 
@@ -470,26 +556,38 @@ bot.on("callback_query", async (query) => {
         { filename: `${baseName}.pdf`, contentType: "application/pdf" }
       );
 
-      await bot.deleteMessage(chatId, messageId);
+      await bot.deleteMessage(chatId, messageId).catch(() => {});
       logger.info({ chatId, fileName, imageCount: images.length }, "PDF sent");
     } catch (err) {
-      logger.error({ err, chatId, fileName }, "PDF send error");
-      bot.editMessageText(
-        `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
-        { chat_id: chatId, message_id: messageId }
-      ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+      if (err instanceof JobCancelledError) {
+        bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
+          .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
+      } else {
+        logger.error({ err, chatId, fileName }, "PDF send error");
+        bot.editMessageText(
+          `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
+          { chat_id: chatId, message_id: messageId }
+        ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+      }
     } finally {
       if (pdfPath && fs.existsSync(pdfPath)) { try { fs.unlinkSync(pdfPath); } catch { /* ignore */ } }
+      finishJob(chatId, ct);
     }
 
-  // ── Images ──
+  // ── MHT → Images ─────────────────────────────────────────────────────────────
   } else if (action === "send_images") {
     await bot.editMessageText(`⏳ "${fileName}" ကို လုပ်ဆောင်နေသည်...`, {
       chat_id: chatId, message_id: messageId,
     });
 
     try {
-      const images = await downloadAndExtract(fileId, fileName, chatId, messageId);
+      const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct);
+
+      await bot.editMessageText(`⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
+        chat_id: chatId, message_id: messageId,
+      });
+
+      const images = await extractImagesFromMht(mhtBuffer, ct);
 
       if (images.length === 0) {
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
@@ -502,16 +600,22 @@ bot.on("callback_query", async (query) => {
         { chat_id: chatId, message_id: messageId }
       );
 
-      await sendImagesAsMediaGroups(chatId, images, baseName, messageId);
-
-      await bot.deleteMessage(chatId, messageId);
+      await sendImagesAsMediaGroups(chatId, images, baseName, messageId, ct);
+      await bot.deleteMessage(chatId, messageId).catch(() => {});
       logger.info({ chatId, fileName, imageCount: images.length }, "Images sent as media groups");
     } catch (err) {
-      logger.error({ err, chatId, fileName }, "Images send error");
-      bot.editMessageText(
-        `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
-        { chat_id: chatId, message_id: messageId }
-      ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+      if (err instanceof JobCancelledError) {
+        bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
+          .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
+      } else {
+        logger.error({ err, chatId, fileName }, "Images send error");
+        bot.editMessageText(
+          `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
+          { chat_id: chatId, message_id: messageId }
+        ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+      }
+    } finally {
+      finishJob(chatId, ct);
     }
   }
 });
