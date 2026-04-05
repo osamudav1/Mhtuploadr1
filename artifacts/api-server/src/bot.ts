@@ -17,6 +17,12 @@ const bot = new TelegramBot(token, { polling: true });
 
 logger.info("Telegram bot started with polling");
 
+const OWNER_ID = 6762363593;
+
+function isOwner(userId: number | undefined): boolean {
+  return userId === OWNER_ID;
+}
+
 // Store pending file info waiting for user's choice
 interface PendingFile {
   fileId: string;
@@ -206,6 +212,7 @@ async function downloadAndExtract(
 // ─── Commands ───────────────────────────────────────────────────────────────
 
 bot.onText(/\/start/, (msg) => {
+  if (!isOwner(msg.from?.id)) return;
   bot.sendMessage(
     msg.chat.id,
     `မင်္ဂလာပါ! 📚\n\n` +
@@ -218,6 +225,7 @@ bot.onText(/\/start/, (msg) => {
 });
 
 bot.onText(/\/help/, (msg) => {
+  if (!isOwner(msg.from?.id)) return;
   bot.sendMessage(
     msg.chat.id,
     `📖 အသုံးပြုနည်း:\n\n` +
@@ -233,6 +241,7 @@ bot.onText(/\/help/, (msg) => {
 // ─── Document Handler ────────────────────────────────────────────────────────
 
 bot.on("document", async (msg) => {
+  if (!isOwner(msg.from?.id)) return;
   const chatId = msg.chat.id;
   const document = msg.document;
   if (!document) return;
@@ -287,6 +296,7 @@ bot.on("document", async (msg) => {
 // ─── Callback Query Handler ───────────────────────────────────────────────────
 
 bot.on("callback_query", async (query) => {
+  if (!isOwner(query.from?.id)) return;
   const chatId = query.message?.chat.id;
   const messageId = query.message?.message_id;
   if (!chatId || !messageId) return;
