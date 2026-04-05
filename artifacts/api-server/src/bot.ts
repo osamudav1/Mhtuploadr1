@@ -5,7 +5,11 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { logger } from "./lib/logger";
+
+const execFileAsync = promisify(execFile);
 
 const token = process.env["TELEGRAM_BOT_TOKEN"];
 if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");
@@ -143,7 +147,37 @@ async function extractImagesFromMht(mhtContent: Buffer): Promise<Buffer[]> {
   return sorted.map(p => p.buffer);
 }
 
-// ─── PDF ─────────────────────────────────────────────────────────────────────
+// ─── PDF → Images (pdftoppm) ──────────────────────────────────────────────────
+
+async function extractImagesFromPdf(pdfBuffer: Buffer): Promise<Buffer[]> {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pdf_"));
+  const pdfPath = path.join(tmpDir, "input.pdf");
+  const outPrefix = path.join(tmpDir, "page");
+
+  try {
+    fs.writeFileSync(pdfPath, pdfBuffer);
+
+    // pdftoppm converts each page to a PNG image  (output: page-001.png, page-002.png, ...)
+    await execFileAsync("pdftoppm", ["-r", "200", "-png", pdfPath, outPrefix]);
+
+    const files = fs.readdirSync(tmpDir)
+      .filter(f => f.startsWith("page") && f.endsWith(".png"))
+      .sort(); // pdftoppm names them with zero-padded numbers → lexicographic sort is correct
+
+    logger.info({ pageCount: files.length }, "PDF pages extracted");
+
+    const buffers: Buffer[] = [];
+    for (const file of files) {
+      const imgBuf = fs.readFileSync(path.join(tmpDir, file));
+      buffers.push(imgBuf);
+    }
+    return buffers;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// ─── PDF creation ─────────────────────────────────────────────────────────────
 
 async function createPdfFromImages(images: Buffer[]): Promise<string> {
   const pdfPath = path.join(os.tmpdir(), `manga_${Date.now()}.pdf`);
@@ -266,11 +300,10 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `မင်္ဂလာပါ! 📚\n\n` +
-      `.mht ဖိုင် (manga chapter) ကို Document အဖြစ် ပို့ပါ။\n\n` +
-      `Bot က ပုံ‌တွေ ထုတ်ပြီး:\n` +
-      `• 📄 PDF အဖြစ် ပြောင်းပြီး ပို့\n` +
-      `• 🖼 ပုံများ တိုက်ရိုက် (10 ပုံစီ) ပို့\n\n` +
-      `ဆိုသည့် နည်းနှစ်မျိုးထဲ ရွေးနိုင်သည်။`
+      `ဖိုင် ၂ မျိုး လက်ခံသည်:\n\n` +
+      `📄 .pdf ဖိုင် → ပုံများ တိုက်ရိုက် (10 ပုံစီ) ပို့ပေးသည်\n` +
+      `🗂 .mht / .mhtml ဖိုင် → PDF သို့မဟုတ် ပုံများ ရွေးချယ်နိုင်သည်\n\n` +
+      `ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ။`
   );
 });
 
@@ -279,12 +312,13 @@ bot.onText(/\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `📖 အသုံးပြုနည်း:\n\n` +
-      `1. .mht ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ\n` +
-      `2. Bot က ပုံ‌တွေ ထုတ်ပြီး နည်း ၂ မျိုး offer ပေးမည်\n` +
-      `3. ကြိုက်သည့် နည်းကို ရွေးပါ\n\n` +
-      `⚠️ မှတ်ချက်:\n` +
-      `• ဖိုင်ကို Photo/Video မဟုတ်ဘဲ Document အဖြစ် ပို့ပါ\n` +
-      `• .mht / .mhtml format သာ လက်ခံသည်`
+      `【 PDF ဖိုင် 】\n` +
+      `• .pdf ဖိုင် Document ပို့ပါ\n` +
+      `• Bot က အလိုအလျောက် စာမျက်နှာ တစ်မျက်နှာချင်း ပုံများအဖြစ် (10 ပုံစီ) ပို့မည်\n\n` +
+      `【 MHT ဖိုင် 】\n` +
+      `• .mht / .mhtml ဖိုင် Document ပို့ပါ\n` +
+      `• PDF အဖြစ် ပြောင်းပို့ (သို့) ပုံများ တိုက်ရိုက် ပို့ ရွေးနိုင်သည်\n\n` +
+      `⚠️ မှတ်ချက်: ဖိုင်ကို Photo မဟုတ်ဘဲ Document အဖြစ် ပို့ပါ`
   );
 });
 
@@ -297,14 +331,71 @@ bot.on("document", async (msg) => {
   if (!document) return;
 
   const fileName = document.file_name ?? "";
+  const lowerName = fileName.toLowerCase();
+
   const isMht =
-    fileName.toLowerCase().endsWith(".mht") ||
-    fileName.toLowerCase().endsWith(".mhtml") ||
+    lowerName.endsWith(".mht") ||
+    lowerName.endsWith(".mhtml") ||
     document.mime_type === "message/rfc822" ||
     document.mime_type === "multipart/related";
 
+  const isPdf =
+    lowerName.endsWith(".pdf") ||
+    document.mime_type === "application/pdf";
+
+  // ── PDF: download immediately and send as media groups ──
+  if (isPdf) {
+    const statusMsg = await bot.sendMessage(chatId, `⏳ "${fileName}" ကို လုပ်ဆောင်နေသည်...`);
+    const statusMsgId = statusMsg.message_id;
+    const baseName = path.basename(fileName, ".pdf");
+
+    try {
+      await bot.editMessageText(`⏳ "${fileName}"\nဖိုင် ဒေါင်းလုပ် ဆွဲနေသည်...`, {
+        chat_id: chatId, message_id: statusMsgId,
+      });
+
+      const fileLink = await bot.getFileLink(document.file_id);
+      const response = await axios.get(fileLink, {
+        responseType: "arraybuffer",
+        maxContentLength: 100 * 1024 * 1024,
+      });
+      const pdfBuffer = Buffer.from(response.data);
+
+      await bot.editMessageText(`⏳ PDF ဖိုင်မှ ပုံများ ထုတ်နေသည်...`, {
+        chat_id: chatId, message_id: statusMsgId,
+      });
+
+      const images = await extractImagesFromPdf(pdfBuffer);
+
+      if (images.length === 0) {
+        await bot.editMessageText(`❌ PDF ထဲတွင် ပုံများ မတွေ့ပါ။`, {
+          chat_id: chatId, message_id: statusMsgId,
+        });
+        return;
+      }
+
+      const totalGroups = Math.ceil(images.length / 10);
+      await bot.editMessageText(
+        `⏳ စာမျက်နှာ ${images.length} မျက်နှာ တွေ့ပြီ။ ${totalGroups} အုပ်စုနဲ့ ပို့မည်...`,
+        { chat_id: chatId, message_id: statusMsgId }
+      );
+
+      await sendImagesAsMediaGroups(chatId, images, baseName, statusMsgId);
+      await bot.deleteMessage(chatId, statusMsgId);
+      logger.info({ chatId, fileName, pageCount: images.length }, "PDF pages sent as media groups");
+    } catch (err) {
+      logger.error({ err, chatId, fileName }, "PDF processing error");
+      bot.editMessageText(
+        `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
+        { chat_id: chatId, message_id: statusMsgId }
+      ).catch(() => bot.sendMessage(chatId, "❌ PDF လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+    }
+    return;
+  }
+
+  // ── MHT: show choice keyboard ──
   if (!isMht) {
-    bot.sendMessage(chatId, `❌ .mht သို့မဟုတ် .mhtml ဖိုင်သာ လက်ခံသည်။\nပေးပို့သော ဖိုင်: ${fileName}`);
+    bot.sendMessage(chatId, `❌ .mht / .mhtml / .pdf ဖိုင်သာ လက်ခံသည်။\nပေးပို့သော ဖိုင်: ${fileName}`);
     return;
   }
 
