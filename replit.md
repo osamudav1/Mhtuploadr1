@@ -16,6 +16,21 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - **API codegen**: Orval (from OpenAPI spec)
 - **Build**: esbuild (CJS bundle)
 
+## Telegram Bot
+
+A Telegram bot is integrated into the API server (`artifacts/api-server/src/bot.ts`). It:
+- Accepts `.mht` / `.mhtml` files (manga chapter files saved from browser)
+- Extracts images in sequential order from the MIME multipart format
+- Converts images to PDF using pdfkit + sharp
+- Sends the PDF back to the user via Telegram
+
+**Bot token**: `TELEGRAM_BOT_TOKEN` secret is required (already configured)
+
+**Bot commands**:
+- `/start` — Welcome message
+- `/help` — Usage instructions
+- Send a `.mht` document — Bot processes and returns a PDF
+
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages
