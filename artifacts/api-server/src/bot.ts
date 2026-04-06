@@ -11,8 +11,35 @@ import { logger } from "./lib/logger";
 const token = process.env["TELEGRAM_BOT_TOKEN"];
 if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");
 
-const bot = new TelegramBot(token, { polling: true });
-logger.info("Telegram bot started with polling");
+// Start without polling — initBot() will set up webhook or polling
+const bot = new TelegramBot(token, { polling: false });
+
+export async function initBot() {
+  const isProduction = process.env.NODE_ENV === "production";
+
+  if (isProduction) {
+    // Production: register webhook so dev polling doesn't conflict
+    const domain = process.env.REPLIT_DOMAINS?.split(",")[0]?.trim();
+    if (!domain) throw new Error("REPLIT_DOMAINS not set — cannot configure webhook");
+    const webhookUrl = `https://${domain}/api/telegram-webhook`;
+    await bot.setWebHook(webhookUrl);
+    logger.info({ webhookUrl }, "Telegram bot webhook configured");
+  } else {
+    // Development: only poll if production webhook is NOT set
+    const info = await bot.getWebHookInfo();
+    if (info.url) {
+      // Production is live and using webhook — dev stands down
+      logger.warn(
+        { webhookUrl: info.url },
+        "Production webhook is active — dev polling skipped to avoid 409 conflict. " +
+        "Stop the deployed app or clear the webhook to enable dev polling."
+      );
+    } else {
+      await bot.startPolling({ restart: false });
+      logger.info("Telegram bot started with polling (no active webhook found)");
+    }
+  }
+}
 
 const OWNER_ID = 6762363593;
 function isOwner(userId: number | undefined): boolean {
@@ -620,8 +647,14 @@ bot.on("callback_query", async (query) => {
   }
 });
 
-bot.on("polling_error", (err) => {
-  logger.error({ err }, "Telegram polling error");
+bot.on("polling_error", (err: any) => {
+  if (err?.response?.statusCode === 409) {
+    // Another instance (production) is polling — stop dev polling to avoid conflict
+    bot.stopPolling().catch(() => {});
+    logger.warn("Dev polling stopped: production bot already running (409 conflict). Redeploy to activate new features.");
+  } else {
+    logger.error({ err }, "Telegram polling error");
+  }
 });
 
 export { bot };

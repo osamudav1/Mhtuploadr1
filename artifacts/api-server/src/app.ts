@@ -3,6 +3,7 @@ import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
+import { bot } from "./bot";
 
 const app: Express = express();
 
@@ -28,6 +29,12 @@ app.use(
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Telegram webhook endpoint (used in production)
+app.post("/api/telegram-webhook", (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
 
 app.use("/api", router);
 
