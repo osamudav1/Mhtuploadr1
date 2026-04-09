@@ -27,7 +27,6 @@ app.listen(port, async (err) => {
   try {
     await initBot();
   } catch (e) {
-    logger.error({ err: e }, "Failed to init Telegram bot");
-    process.exit(1);
+    logger.error({ err: e }, "Failed to init Telegram bot — server stays up, bot is offline");
   }
 });

@@ -15,30 +15,11 @@ if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required
 const bot = new TelegramBot(token, { polling: false });
 
 export async function initBot() {
-  const isProduction = process.env.NODE_ENV === "production";
+  // Clear any stale webhook first (ensures polling mode works cleanly)
+  await bot.deleteWebHook();
 
-  if (isProduction) {
-    // Production: register webhook so dev polling doesn't conflict
-    const domain = process.env.REPLIT_DOMAINS?.split(",")[0]?.trim();
-    if (!domain) throw new Error("REPLIT_DOMAINS not set — cannot configure webhook");
-    const webhookUrl = `https://${domain}/api/telegram-webhook`;
-    await bot.setWebHook(webhookUrl);
-    logger.info({ webhookUrl }, "Telegram bot webhook configured");
-  } else {
-    // Development: only poll if production webhook is NOT set
-    const info = await bot.getWebHookInfo();
-    if (info.url) {
-      // Production is live and using webhook — dev stands down
-      logger.warn(
-        { webhookUrl: info.url },
-        "Production webhook is active — dev polling skipped to avoid 409 conflict. " +
-        "Stop the deployed app or clear the webhook to enable dev polling."
-      );
-    } else {
-      await bot.startPolling({ restart: false });
-      logger.info("Telegram bot started with polling (no active webhook found)");
-    }
-  }
+  await bot.startPolling({ restart: false });
+  logger.info("Telegram bot started with polling");
 }
 
 const OWNER_ID = 6762363593;
