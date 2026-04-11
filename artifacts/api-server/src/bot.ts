@@ -78,6 +78,37 @@ function finishJob(chatId: number, token: CancelToken) {
   if (activeJobs.get(chatId) === token) activeJobs.delete(chatId);
 }
 
+// ─── 429 Retry Helper ─────────────────────────────────────────────────────────
+
+async function callWithRetry<T>(
+  fn: () => Promise<T>,
+  ct?: CancelToken,
+  maxAttempts = 5
+): Promise<T> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      if (ct?.cancelled) throw new JobCancelledError();
+      const retryAfterSec: number | undefined =
+        err?.response?.body?.parameters?.retry_after ??
+        (err?.response?.statusCode === 429 ? 30 : undefined);
+      if (retryAfterSec !== undefined && attempt < maxAttempts - 1) {
+        const waitMs = (retryAfterSec + 1) * 1000;
+        logger.warn({ retryAfterSec, attempt }, `429 rate limit — waiting ${retryAfterSec}s before retry`);
+        await new Promise<void>((res, rej) => {
+          const t = setTimeout(res, waitMs);
+          ct?.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
+        }).finally(() => ct?.unregisterChild());
+        if (ct?.cancelled) throw new JobCancelledError();
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("callWithRetry: exhausted attempts");
+}
+
 // ─── Pending files (MHT choice keyboard) ─────────────────────────────────────
 
 interface PendingFile {
@@ -307,10 +338,16 @@ async function sendImagesAsMediaGroups(
       const end = Math.min(start + groupSize, images.length);
       const groupFiles = tempFiles.slice(start, end);
 
-      await bot.editMessageText(
-        `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
-        { chat_id: chatId, message_id: statusMsgId }
-      ).catch(() => {});
+      // Only update status every 3 groups (or first/last) to reduce API calls
+      if (g === 0 || g === totalGroups - 1 || g % 3 === 0) {
+        await callWithRetry(
+          () => bot.editMessageText(
+            `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
+            { chat_id: chatId, message_id: statusMsgId }
+          ),
+          ct
+        ).catch(() => {});
+      }
 
       const media = groupFiles.map((filePath, idx) => ({
         type: "photo" as const,
@@ -320,12 +357,12 @@ async function sendImagesAsMediaGroups(
           : {}),
       }));
 
-      await bot.sendMediaGroup(chatId, media);
+      await callWithRetry(() => bot.sendMediaGroup(chatId, media), ct);
 
       if (g < totalGroups - 1) {
+        // 3s delay between groups to avoid rate limits
         await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, 1500);
-          // Allow cancel to interrupt the delay
+          const t = setTimeout(res, 3000);
           ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
         }).finally(() => ct.unregisterChild());
       }
@@ -555,13 +592,17 @@ bot.on("callback_query", async (query) => {
 
       pdfPath = await createPdfFromImages(images, ct);
 
-      await bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: messageId });
+      await callWithRetry(() =>
+        bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: messageId }), ct
+      ).catch(() => {});
 
-      await bot.sendDocument(
-        chatId,
-        pdfPath,
-        { caption: `📄 ${baseName}.pdf\n✅ ပုံ ${images.length} ပုံ ပါဝင်သည်` },
-        { filename: `${baseName}.pdf`, contentType: "application/pdf" }
+      await callWithRetry(() =>
+        bot.sendDocument(
+          chatId,
+          pdfPath!,
+          { caption: `📄 ${baseName}.pdf\n✅ ပုံ ${images.length} ပုံ ပါဝင်သည်` },
+          { filename: `${baseName}.pdf`, contentType: "application/pdf" }
+        ), ct
       );
 
       await bot.deleteMessage(chatId, messageId).catch(() => {});
