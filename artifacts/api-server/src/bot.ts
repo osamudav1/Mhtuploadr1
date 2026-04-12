@@ -16,10 +16,11 @@ if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required
 // Files up to 2000 MB can be downloaded when using the local server.
 
 const LOCAL_BOT_API_PORT = 8082;
-const LOCAL_BOT_API_URL = `http://127.0.0.1:${LOCAL_BOT_API_PORT}/bot`;
+const LOCAL_BOT_API_BASE = `http://127.0.0.1:${LOCAL_BOT_API_PORT}`;
 const TG_BOT_API_BIN = "/nix/store/8lna1zsjag85d0fml9gjmhab899ffqfw-telegram-bot-api-8.2/bin/telegram-bot-api";
 
 let localApiProcess: ChildProcess | null = null;
+let usingLocalServer = false;
 
 async function startLocalBotApiServer(): Promise<void> {
   const apiId = process.env["TELEGRAM_API_ID"];
@@ -90,7 +91,7 @@ async function startLocalBotApiServer(): Promise<void> {
 // Probe the local server with a simple HTTP GET
 async function isLocalServerReady(): Promise<boolean> {
   try {
-    await axios.get(`http://127.0.0.1:${LOCAL_BOT_API_PORT}`, { timeout: 2000 });
+    await axios.get(LOCAL_BOT_API_BASE, { timeout: 2000 });
     return true;
   } catch (e: any) {
     // 404 from the local server is fine — it means it's running
@@ -117,8 +118,9 @@ export async function initBot() {
         await new Promise(r => setTimeout(r, 1000));
         attempts++;
       }
-      // Switch bot to use local server
-      (bot as any).options.apiRoot = LOCAL_BOT_API_URL;
+      // Switch bot to use local server — library uses options.baseApiUrl
+      (bot as any).options.baseApiUrl = LOCAL_BOT_API_BASE;
+      usingLocalServer = true;
       logger.info({ port: LOCAL_BOT_API_PORT }, "Local bot API server ready — 2 GB file limit active");
     } catch (err) {
       logger.warn({ err }, "Local bot API server failed to start — continuing with standard 20 MB limit");
@@ -539,12 +541,26 @@ async function downloadFile(
     { chat_id: chatId, message_id: statusMsgId }
   );
 
-  const fileLink = await bot.getFileLink(fileId);
+  const fileInfo = await bot.getFile(fileId);
   ct.throwIfCancelled();
 
-  const response = await axios.get(fileLink, {
+  if (usingLocalServer && fileInfo.file_path) {
+    // Local server (--local mode) stores files on disk — read directly
+    const localPath = fileInfo.file_path;
+    return await new Promise<Buffer>((resolve, reject) => {
+      fs.readFile(localPath, (err, data) => {
+        if (err) reject(err);
+        else resolve(data);
+      });
+    });
+  }
+
+  // Standard cloud API — download via HTTP
+  const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
+  const fileUrl = `${baseApiUrl}/file/bot${token}/${fileInfo.file_path}`;
+  const response = await axios.get(fileUrl, {
     responseType: "arraybuffer",
-    maxContentLength: 100 * 1024 * 1024,
+    maxContentLength: 2000 * 1024 * 1024,
     signal: ct.signal,
   });
   return Buffer.from(response.data);
@@ -616,7 +632,7 @@ bot.on("document", async (msg) => {
 
   // ── File size guard ───────────────────────────────────────────────────────────
   // With local bot API server: up to 2000 MB. Without: 20 MB.
-  const usingLocalServer = !!(localApiProcess && process.env["TELEGRAM_API_ID"]);
+  // usingLocalServer is set at module level when local bot API server starts successfully
   const TG_DOWNLOAD_MAX = usingLocalServer ? 2000 * 1024 * 1024 : 20 * 1024 * 1024;
   const fileSize = document.file_size ?? 0;
   if (fileSize > TG_DOWNLOAD_MAX) {
