@@ -305,6 +305,52 @@ async function createPdfFromImages(images: Buffer[], ct: CancelToken): Promise<s
   });
 }
 
+// ─── Adaptive Image Compression ──────────────────────────────────────────────
+
+const TG_PHOTO_MAX = 9.5 * 1024 * 1024; // Telegram photo limit ~10MB, use 9.5MB to be safe
+
+async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
+  // Step 1: try decreasing JPEG quality at max width
+  const widthSteps   = [2048, 1600, 1280, 1024, 800];
+  const qualitySteps = [90, 80, 70, 60, 50, 40, 30];
+
+  for (const quality of qualitySteps) {
+    const buf = await sharp(imgBuffer)
+      .jpeg({ quality })
+      .resize({ width: 2048, withoutEnlargement: true })
+      .toBuffer();
+    if (buf.length <= TG_PHOTO_MAX) {
+      const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+      fs.writeFileSync(tmpPath, buf);
+      return tmpPath;
+    }
+  }
+
+  // Step 2: reduce both width and quality together
+  for (const width of widthSteps) {
+    for (const quality of [60, 50, 40, 30]) {
+      const buf = await sharp(imgBuffer)
+        .jpeg({ quality })
+        .resize({ width, withoutEnlargement: true })
+        .toBuffer();
+      if (buf.length <= TG_PHOTO_MAX) {
+        const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+        fs.writeFileSync(tmpPath, buf);
+        return tmpPath;
+      }
+    }
+  }
+
+  // Step 3: last resort — smallest acceptable size
+  const buf = await sharp(imgBuffer)
+    .jpeg({ quality: 25 })
+    .resize({ width: 800, withoutEnlargement: true })
+    .toBuffer();
+  const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+  fs.writeFileSync(tmpPath, buf);
+  return tmpPath;
+}
+
 // ─── Media Groups ─────────────────────────────────────────────────────────────
 
 async function sendImagesAsMediaGroups(
@@ -314,17 +360,12 @@ async function sendImagesAsMediaGroups(
   statusMsgId: number,
   ct: CancelToken
 ): Promise<void> {
-  const tmpDir = os.tmpdir();
   const tempFiles: string[] = [];
 
   try {
     for (let i = 0; i < images.length; i++) {
       ct.throwIfCancelled();
-      const imgPath = path.join(tmpDir, `img_${Date.now()}_${String(i).padStart(5, "0")}.jpg`);
-      await sharp(images[i])
-        .jpeg({ quality: 90 })
-        .resize({ width: 2048, withoutEnlargement: true })
-        .toFile(imgPath);
+      const imgPath = await compressForTelegram(images[i]);
       tempFiles.push(imgPath);
     }
 
