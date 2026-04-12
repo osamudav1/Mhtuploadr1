@@ -505,6 +505,22 @@ bot.on("document", async (msg) => {
     lowerName.endsWith(".pdf") ||
     document.mime_type === "application/pdf";
 
+  // ── File size guard (Telegram Bot API limit: 20 MB) ──────────────────────────
+  const TG_DOWNLOAD_MAX = 20 * 1024 * 1024;
+  const fileSize = document.file_size ?? 0;
+  if (fileSize > TG_DOWNLOAD_MAX) {
+    const sizeMB = (fileSize / 1024 / 1024).toFixed(1);
+    bot.sendMessage(
+      chatId,
+      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိသောကြောင့် download မလုပ်နိုင်ပါ။\n\n` +
+      `⚠️ Telegram Bot API သည် 20 MB ထက်ကြီးသောဖိုင်ကို download လုပ်ခွင့် မပြုပါ။\n\n` +
+      `💡 ဖြေရှင်းနည်း:\n` +
+      `• ဖိုင်ကို compress (zip/rar) ဖြင့် 20 MB အောက်ချုံ့ပါ\n` +
+      `• ဒါမှမဟုတ် chapter ကို 2 ပိုင်း ခွဲပြီး တစ်ပိုင်းချင်း ပို့ပါ`
+    );
+    return;
+  }
+
   // ── PDF ──────────────────────────────────────────────────────────────────────
   if (isPdf) {
     // Cancel any running job and start fresh
