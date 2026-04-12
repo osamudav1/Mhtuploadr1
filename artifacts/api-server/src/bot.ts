@@ -5,19 +5,128 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { logger } from "./lib/logger";
 
 const token = process.env["TELEGRAM_BOT_TOKEN"];
 if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");
 
-// Start without polling — initBot() will set up webhook or polling
+// ─── Local Bot API Server ─────────────────────────────────────────────────────
+// Runs the local Telegram Bot API server to bypass the 20 MB file download limit.
+// Files up to 2000 MB can be downloaded when using the local server.
+
+const LOCAL_BOT_API_PORT = 8082;
+const LOCAL_BOT_API_URL = `http://127.0.0.1:${LOCAL_BOT_API_PORT}/bot`;
+const TG_BOT_API_BIN = "/nix/store/8lna1zsjag85d0fml9gjmhab899ffqfw-telegram-bot-api-8.2/bin/telegram-bot-api";
+
+let localApiProcess: ChildProcess | null = null;
+
+async function startLocalBotApiServer(): Promise<void> {
+  const apiId = process.env["TELEGRAM_API_ID"];
+  const apiHash = process.env["TELEGRAM_API_HASH"];
+
+  if (!apiId || !apiHash) {
+    logger.warn("TELEGRAM_API_ID or TELEGRAM_API_HASH not set — local bot API server disabled (20 MB limit applies)");
+    return;
+  }
+
+  if (!fs.existsSync(TG_BOT_API_BIN)) {
+    logger.warn("telegram-bot-api binary not found — local bot API server disabled");
+    return;
+  }
+
+  const workDir = path.join(os.tmpdir(), "tg-bot-api");
+  fs.mkdirSync(workDir, { recursive: true });
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      TG_BOT_API_BIN,
+      [
+        `--api-id=${apiId}`,
+        `--api-hash=${apiHash}`,
+        `--local`,
+        `--http-port=${LOCAL_BOT_API_PORT}`,
+        `--dir=${workDir}`,
+        `--temp-dir=${os.tmpdir()}`,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    localApiProcess = proc;
+
+    let ready = false;
+
+    const onData = (chunk: Buffer) => {
+      const line = chunk.toString();
+      if (line.includes("Start to receive") || line.includes("listening") || line.includes("LISTENING")) {
+        if (!ready) {
+          ready = true;
+          resolve();
+        }
+      }
+    };
+    proc.stdout?.on("data", onData);
+    proc.stderr?.on("data", onData);
+
+    proc.on("error", (err) => {
+      logger.error({ err }, "Local bot API server error");
+      if (!ready) reject(err);
+    });
+
+    proc.on("exit", (code) => {
+      logger.warn({ code }, "Local bot API server exited");
+      localApiProcess = null;
+    });
+
+    // Give it up to 10s to start
+    setTimeout(() => {
+      if (!ready) {
+        ready = true;
+        resolve(); // resolve anyway — server might still be starting
+      }
+    }, 10_000);
+  });
+}
+
+// Probe the local server with a simple HTTP GET
+async function isLocalServerReady(): Promise<boolean> {
+  try {
+    await axios.get(`http://127.0.0.1:${LOCAL_BOT_API_PORT}`, { timeout: 2000 });
+    return true;
+  } catch (e: any) {
+    // 404 from the local server is fine — it means it's running
+    if (e?.response?.status === 404 || e?.response?.status === 400) return true;
+    return false;
+  }
+}
+
+// Start without polling — initBot() will set up local server + polling
 const bot = new TelegramBot(token, { polling: false });
 
 export async function initBot() {
+  // Try to start local bot API server for large file support
+  const apiId = process.env["TELEGRAM_API_ID"];
+  const apiHash = process.env["TELEGRAM_API_HASH"];
+
+  if (apiId && apiHash) {
+    try {
+      await startLocalBotApiServer();
+      // Wait for server readiness
+      let attempts = 0;
+      while (attempts < 15) {
+        if (await isLocalServerReady()) break;
+        await new Promise(r => setTimeout(r, 1000));
+        attempts++;
+      }
+      // Switch bot to use local server
+      (bot as any).options.apiRoot = LOCAL_BOT_API_URL;
+      logger.info({ port: LOCAL_BOT_API_PORT }, "Local bot API server ready — 2 GB file limit active");
+    } catch (err) {
+      logger.warn({ err }, "Local bot API server failed to start — continuing with standard 20 MB limit");
+    }
+  }
+
   // Clear any stale webhook first (ensures polling mode works cleanly)
   await bot.deleteWebHook();
-
   await bot.startPolling({ restart: false });
   logger.info("Telegram bot started with polling");
 }
@@ -505,18 +614,18 @@ bot.on("document", async (msg) => {
     lowerName.endsWith(".pdf") ||
     document.mime_type === "application/pdf";
 
-  // ── File size guard (Telegram Bot API limit: 20 MB) ──────────────────────────
-  const TG_DOWNLOAD_MAX = 20 * 1024 * 1024;
+  // ── File size guard ───────────────────────────────────────────────────────────
+  // With local bot API server: up to 2000 MB. Without: 20 MB.
+  const usingLocalServer = !!(localApiProcess && process.env["TELEGRAM_API_ID"]);
+  const TG_DOWNLOAD_MAX = usingLocalServer ? 2000 * 1024 * 1024 : 20 * 1024 * 1024;
   const fileSize = document.file_size ?? 0;
   if (fileSize > TG_DOWNLOAD_MAX) {
     const sizeMB = (fileSize / 1024 / 1024).toFixed(1);
+    const limitMB = usingLocalServer ? "2000" : "20";
     bot.sendMessage(
       chatId,
-      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိသောကြောင့် download မလုပ်နိုင်ပါ။\n\n` +
-      `⚠️ Telegram Bot API သည် 20 MB ထက်ကြီးသောဖိုင်ကို download လုပ်ခွင့် မပြုပါ။\n\n` +
-      `💡 ဖြေရှင်းနည်း:\n` +
-      `• ဖိုင်ကို compress (zip/rar) ဖြင့် 20 MB အောက်ချုံ့ပါ\n` +
-      `• ဒါမှမဟုတ် chapter ကို 2 ပိုင်း ခွဲပြီး တစ်ပိုင်းချင်း ပို့ပါ`
+      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိ၍ ${limitMB} MB ကန့်သတ်ချက်ကျော်နေပါသည်။\n\n` +
+      `💡 chapter ကို ပိုင်းခြားပြီး ပို့ပါ။`
     );
     return;
   }
