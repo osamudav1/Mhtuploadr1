@@ -859,6 +859,13 @@ bot.on("callback_query", async (query) => {
   }
 });
 
+// ─── Non-owner catch-all ─────────────────────────────────────────────────────
+// Reply to any message from non-owners so they know the bot is private.
+bot.on("message", (msg) => {
+  if (isOwner(msg.from?.id)) return;
+  bot.sendMessage(msg.chat.id, "🔒 ဤ bot သည် private use ဖြစ်သောကြောင့် သင်အသုံးမပြုနိုင်ပါ။");
+});
+
 bot.on("polling_error", (err: any) => {
   if (err?.response?.statusCode === 409) {
     // Another instance (production) is polling — stop dev polling to avoid conflict
