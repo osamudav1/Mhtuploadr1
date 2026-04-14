@@ -17,7 +17,15 @@ if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required
 
 const LOCAL_BOT_API_PORT = 8082;
 const LOCAL_BOT_API_BASE = `http://127.0.0.1:${LOCAL_BOT_API_PORT}`;
-const TG_BOT_API_BIN = "/nix/store/8lna1zsjag85d0fml9gjmhab899ffqfw-telegram-bot-api-8.2/bin/telegram-bot-api";
+
+// Binary search order: env var → standard Linux path → Replit Nix store
+const TG_BOT_API_BIN_CANDIDATES = [
+  process.env["TG_BOT_API_BIN"],
+  "/usr/local/bin/telegram-bot-api",
+  "/nix/store/8lna1zsjag85d0fml9gjmhab899ffqfw-telegram-bot-api-8.2/bin/telegram-bot-api",
+].filter(Boolean) as string[];
+
+const TG_BOT_API_BIN = TG_BOT_API_BIN_CANDIDATES.find(p => fs.existsSync(p)) ?? "";
 
 let localApiProcess: ChildProcess | null = null;
 let usingLocalServer = false;
