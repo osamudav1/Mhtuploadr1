@@ -15,7 +15,8 @@ if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required
 // Runs the local Telegram Bot API server to bypass the 20 MB file download limit.
 // Files up to 2000 MB can be downloaded when using the local server.
 
-const LOCAL_BOT_API_PORT = 8082;
+// Port 8787 avoids conflict with Vite/mockup-sandbox (which uses 8081-8085 range)
+const LOCAL_BOT_API_PORT = 8787;
 const LOCAL_BOT_API_BASE = `http://127.0.0.1:${LOCAL_BOT_API_PORT}`;
 
 // Binary search order: env var → standard Linux path → Replit Nix store
@@ -96,14 +97,20 @@ async function startLocalBotApiServer(): Promise<void> {
   });
 }
 
-// Probe the local server with a simple HTTP GET
+// Probe the local server — verify it's actually a Telegram Bot API server
+// (not a Vite dev server or other HTTP process on the same port)
 async function isLocalServerReady(): Promise<boolean> {
   try {
-    await axios.get(LOCAL_BOT_API_BASE, { timeout: 2000 });
-    return true;
-  } catch (e: any) {
-    // 404 from the local server is fine — it means it's running
-    if (e?.response?.status === 404 || e?.response?.status === 400) return true;
+    const res = await axios.get(`${LOCAL_BOT_API_BASE}/bot${token}/getMe`, {
+      timeout: 2000,
+      validateStatus: () => true,
+    });
+    // Telegram Bot API always returns JSON with an "ok" field
+    if (typeof res.data === "object" && "ok" in res.data) return true;
+    // Got a response but it's not a Telegram API server
+    logger.warn("Port response is not a Telegram Bot API server — local server not ready yet");
+    return false;
+  } catch {
     return false;
   }
 }
@@ -136,7 +143,9 @@ export async function initBot() {
   }
 
   // Clear any stale webhook first (ensures polling mode works cleanly)
-  await bot.deleteWebHook();
+  await bot.deleteWebHook().catch(err => {
+    logger.warn({ err: err?.message }, "deleteWebHook failed — continuing anyway");
+  });
   await bot.startPolling({ restart: false });
   logger.info("Telegram bot started with polling");
 }
