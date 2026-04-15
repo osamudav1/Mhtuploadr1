@@ -438,7 +438,39 @@ async function createPdfFromImages(images: Buffer[], ct: CancelToken): Promise<s
 const TG_PHOTO_MAX = 9.5 * 1024 * 1024; // Telegram photo limit ~10MB, use 9.5MB to be safe
 
 async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
-  // Step 1: try decreasing JPEG quality at max width
+  // ─── Step 0: Enforce Telegram photo dimension constraints ──────────────────
+  // Telegram rejects photos where: width + height > 10000 OR ratio > 20:1
+  const meta = await sharp(imgBuffer).metadata();
+  const origW = meta.width ?? 1;
+  const origH = meta.height ?? 1;
+  let targetW = origW;
+  let targetH = origH;
+
+  // Fix: width + height must be ≤ 10000 (scale proportionally)
+  if (targetW + targetH > 10000) {
+    const scale = 9990 / (targetW + targetH);
+    targetW = Math.max(1, Math.floor(targetW * scale));
+    targetH = Math.max(1, Math.floor(targetH * scale));
+  }
+
+  // Fix: aspect ratio must be ≤ 20:1 (crop the excess from the long side)
+  const ratio = Math.max(targetW, targetH) / Math.min(targetW, targetH);
+  if (ratio > 20) {
+    if (targetH > targetW) {
+      targetH = Math.floor(targetW * 20);
+    } else {
+      targetW = Math.floor(targetH * 20);
+    }
+  }
+
+  if (targetW !== origW || targetH !== origH) {
+    // Use fit:"cover" + position:"top" so we keep the top of tall manga strips
+    imgBuffer = await sharp(imgBuffer)
+      .resize({ width: targetW, height: targetH, fit: "cover", position: "top" })
+      .toBuffer();
+  }
+
+  // ─── Step 1: try decreasing JPEG quality at max width ─────────────────────
   const widthSteps   = [2048, 1600, 1280, 1024, 800];
   const qualitySteps = [90, 80, 70, 60, 50, 40, 30];
 
@@ -454,7 +486,7 @@ async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
     }
   }
 
-  // Step 2: reduce both width and quality together
+  // ─── Step 2: reduce both width and quality together ────────────────────────
   for (const width of widthSteps) {
     for (const quality of [60, 50, 40, 30]) {
       const buf = await sharp(imgBuffer)
@@ -469,7 +501,7 @@ async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
     }
   }
 
-  // Step 3: last resort — smallest acceptable size
+  // ─── Step 3: last resort — smallest acceptable size ───────────────────────
   const buf = await sharp(imgBuffer)
     .jpeg({ quality: 25 })
     .resize({ width: 800, withoutEnlargement: true })
