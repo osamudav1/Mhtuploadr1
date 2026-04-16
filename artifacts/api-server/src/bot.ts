@@ -116,7 +116,14 @@ async function isLocalServerReady(): Promise<boolean> {
 }
 
 // Start without polling — initBot() will set up local server + polling
-const bot = new TelegramBot(token, { polling: false });
+// Generous timeout for large media uploads via local Bot API server
+const bot = new TelegramBot(token, {
+  polling: false,
+  request: {
+    timeout: 5 * 60 * 1000, // 5 minutes per HTTP request
+    forever: true,           // keep-alive connections
+  } as any,
+});
 
 export async function initBot() {
   // Try to start local bot API server for large file support
@@ -224,30 +231,55 @@ function finishJob(chatId: number, token: CancelToken) {
 async function callWithRetry<T>(
   fn: () => Promise<T>,
   ct?: CancelToken,
-  maxAttempts = 5
+  maxAttempts = 6
 ): Promise<T> {
+  let lastErr: any;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       return await fn();
     } catch (err: any) {
+      lastErr = err;
       if (ct?.cancelled) throw new JobCancelledError();
+
+      // 429 rate limit
       const retryAfterSec: number | undefined =
         err?.response?.body?.parameters?.retry_after ??
         (err?.response?.statusCode === 429 ? 30 : undefined);
-      if (retryAfterSec !== undefined && attempt < maxAttempts - 1) {
-        const waitMs = (retryAfterSec + 1) * 1000;
+
+      // Transient network / timeout errors
+      const code = err?.code || err?.cause?.code || err?.response?.code;
+      const msg: string = (err?.message || "").toLowerCase();
+      const isTransient =
+        code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT" ||
+        code === "ECONNRESET" || code === "ECONNREFUSED" ||
+        code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "EPIPE" ||
+        code === "EFATAL" || err?.name === "EFATAL" || err?.name === "EPARSE" ||
+        msg.includes("etimedout") || msg.includes("socket hang up") ||
+        msg.includes("network") || msg.includes("timeout") ||
+        msg.includes("aborted") || msg.includes("econnreset");
+
+      let waitMs = 0;
+      if (retryAfterSec !== undefined) {
+        waitMs = (retryAfterSec + 1) * 1000;
         logger.warn({ retryAfterSec, attempt }, `429 rate limit — waiting ${retryAfterSec}s before retry`);
-        await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, waitMs);
-          ct?.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
-        }).finally(() => ct?.unregisterChild());
-        if (ct?.cancelled) throw new JobCancelledError();
+      } else if (isTransient) {
+        // Exponential backoff: 2s, 4s, 8s, 16s, 30s
+        waitMs = Math.min(2000 * Math.pow(2, attempt), 30000);
+        logger.warn({ code, attempt, msg: err?.message }, `transient error — retrying in ${waitMs}ms`);
       } else {
         throw err;
       }
+
+      if (attempt >= maxAttempts - 1) throw err;
+
+      await new Promise<void>((res, rej) => {
+        const t = setTimeout(res, waitMs);
+        ct?.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
+      }).finally(() => ct?.unregisterChild());
+      if (ct?.cancelled) throw new JobCancelledError();
     }
   }
-  throw new Error("callWithRetry: exhausted attempts");
+  throw lastErr ?? new Error("callWithRetry: exhausted attempts");
 }
 
 // ─── Pending files (MHT choice keyboard) ─────────────────────────────────────
@@ -552,16 +584,11 @@ async function sendImagesAsMediaGroups(
       const end = Math.min(start + groupSize, images.length);
       const groupFiles = tempFiles.slice(start, end);
 
-      // Only update status every 3 groups (or first/last) to reduce API calls
-      if (g === 0 || g === totalGroups - 1 || g % 3 === 0) {
-        await callWithRetry(
-          () => bot.editMessageText(
-            `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
-            { chat_id: chatId, message_id: statusMsgId }
-          ),
-          ct
-        ).catch(() => {});
-      }
+      // Update status every group so user sees real progress
+      bot.editMessageText(
+        `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
+        { chat_id: chatId, message_id: statusMsgId }
+      ).catch(() => { /* edit errors are harmless */ });
 
       const media = groupFiles.map((filePath) => ({
         type: "photo" as const,
@@ -571,9 +598,9 @@ async function sendImagesAsMediaGroups(
       await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
 
       if (g < totalGroups - 1) {
-        // 3s delay between groups to avoid rate limits
+        // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
         await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, 3000);
+          const t = setTimeout(res, 1500);
           ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
         }).finally(() => ct.unregisterChild());
       }
