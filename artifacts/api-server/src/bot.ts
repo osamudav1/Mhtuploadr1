@@ -151,6 +151,19 @@ export async function initBot() {
 }
 
 const OWNER_ID = 6762363593;
+
+// ─── Storage channel routing ──────────────────────────────────────────────────
+// If STORAGE_CHANNEL_ID is set, all media (images & PDFs) are sent to that channel
+// instead of the owner's DM. Status messages always stay in DM.
+// Bot must be added to the channel as an admin with "Post messages" permission.
+const STORAGE_CHANNEL_ID_RAW = process.env["STORAGE_CHANNEL_ID"]?.trim();
+const STORAGE_CHANNEL_ID: number | string | null = STORAGE_CHANNEL_ID_RAW
+  ? (/^-?\d+$/.test(STORAGE_CHANNEL_ID_RAW) ? Number(STORAGE_CHANNEL_ID_RAW) : STORAGE_CHANNEL_ID_RAW)
+  : null;
+
+function targetChat(dmChatId: number): number | string {
+  return STORAGE_CHANNEL_ID ?? dmChatId;
+}
 function isOwner(userId: number | undefined): boolean {
   return userId === OWNER_ID;
 }
@@ -550,15 +563,12 @@ async function sendImagesAsMediaGroups(
         ).catch(() => {});
       }
 
-      const media = groupFiles.map((filePath, idx) => ({
+      const media = groupFiles.map((filePath) => ({
         type: "photo" as const,
         media: fs.createReadStream(filePath),
-        ...(g === 0 && idx === 0
-          ? { caption: `📚 ${baseName}\nပုံ ${images.length} ပုံ (${totalGroups} အုပ်စု)` }
-          : {}),
       }));
 
-      await callWithRetry(() => bot.sendMediaGroup(chatId, media), ct);
+      await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
 
       if (g < totalGroups - 1) {
         // 3s delay between groups to avoid rate limits
@@ -829,9 +839,9 @@ bot.on("callback_query", async (query) => {
 
       await callWithRetry(() =>
         bot.sendDocument(
-          chatId,
+          targetChat(chatId),
           pdfPath!,
-          { caption: `📄 ${baseName}.pdf\n✅ ပုံ ${images.length} ပုံ ပါဝင်သည်` },
+          {},
           { filename: `${baseName}.pdf`, contentType: "application/pdf" }
         ), ct
       );
