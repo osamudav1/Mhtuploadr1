@@ -25,3 +25,8 @@ expertMode = true
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[userenv]
+
+[userenv.shared]
+STORAGE_CHANNEL_ID = "-1003718574261"
