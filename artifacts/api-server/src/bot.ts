@@ -168,8 +168,31 @@ const STORAGE_CHANNEL_ID: number | string | null = STORAGE_CHANNEL_ID_RAW
   ? (/^-?\d+$/.test(STORAGE_CHANNEL_ID_RAW) ? Number(STORAGE_CHANNEL_ID_RAW) : STORAGE_CHANNEL_ID_RAW)
   : null;
 
+// ── Persistent toggle: channel ON/OFF ─────────────────────────────────────────
+const STATE_FILE = path.join(process.cwd(), "bot-state.json");
+let channelEnabled = true; // default ON if STORAGE_CHANNEL_ID is set
+
+function loadChannelState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+      if (typeof raw?.channelEnabled === "boolean") channelEnabled = raw.channelEnabled;
+    }
+  } catch { /* ignore */ }
+}
+function saveChannelState() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ channelEnabled }));
+  } catch { /* ignore */ }
+}
+loadChannelState();
+
+function channelActive(): boolean {
+  return STORAGE_CHANNEL_ID !== null && channelEnabled;
+}
+
 function targetChat(dmChatId: number): number | string {
-  return STORAGE_CHANNEL_ID ?? dmChatId;
+  return channelActive() ? STORAGE_CHANNEL_ID! : dmChatId;
 }
 function isOwner(userId: number | undefined): boolean {
   return userId === OWNER_ID;
@@ -663,6 +686,7 @@ bot.onText(/\/start/, (msg) => {
       `📄 .pdf ဖိုင် → ပုံများ တိုက်ရိုက် (10 ပုံစီ) ပို့ပေးသည်\n` +
       `🗂 .mht / .mhtml ဖိုင် → PDF သို့မဟုတ် ပုံများ ရွေးချယ်နိုင်သည်\n\n` +
       `ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ။\n\n` +
+      `/channel — Storage channel ON/OFF ပြောင်းရန်\n` +
       `/cancel — လုပ်ဆောင်နေသော task ကို ဖျက်ရန်`
   );
 });
@@ -693,6 +717,31 @@ bot.onText(/\/cancel/, async (msg) => {
   } else {
     bot.sendMessage(chatId, "⚠️ ဖျက်စရာ task မရှိပါ။");
   }
+});
+
+// ─── /channel — toggle storage channel ON/OFF ────────────────────────────────
+function channelStatusText(): string {
+  if (STORAGE_CHANNEL_ID === null) {
+    return `📡 Storage Channel: ⚙️ မသတ်မှတ်ထားပါ\n\nSTORAGE_CHANNEL_ID env var ကို သတ်မှတ်ပြီးမှ ON/OFF လုပ်နိုင်ပါမည်။\nယခု ပုံများကို DM သို့သာ ပို့ပါသည်။`;
+  }
+  const dest = channelEnabled ? `📡 Channel (${STORAGE_CHANNEL_ID})` : `💬 DM`;
+  const state = channelEnabled ? "🟢 ON" : "🔴 OFF";
+  return `Storage Channel: ${state}\n\nပုံများ ပို့မည့်နေရာ: ${dest}`;
+}
+
+function channelKeyboard() {
+  if (STORAGE_CHANNEL_ID === null) return undefined;
+  const label = channelEnabled ? "🔴 Channel ပိတ်ရန် (OFF)" : "🟢 Channel ဖွင့်ရန် (ON)";
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: label, callback_data: "channel_toggle" }]],
+    },
+  };
+}
+
+bot.onText(/\/channel/, (msg) => {
+  if (!isOwner(msg.from?.id)) return;
+  bot.sendMessage(msg.chat.id, channelStatusText(), channelKeyboard());
 });
 
 // ─── Document Handler ────────────────────────────────────────────────────────
@@ -817,6 +866,24 @@ bot.on("callback_query", async (query) => {
   await bot.answerCallbackQuery(query.id);
 
   const action = query.data;
+
+  // ── Channel ON/OFF toggle (independent of pending files) ────────────────────
+  if (action === "channel_toggle") {
+    if (STORAGE_CHANNEL_ID === null) {
+      await bot.editMessageText(channelStatusText(), {
+        chat_id: chatId, message_id: messageId,
+      }).catch(() => {});
+      return;
+    }
+    channelEnabled = !channelEnabled;
+    saveChannelState();
+    await bot.editMessageText(channelStatusText(), {
+      chat_id: chatId, message_id: messageId,
+      ...channelKeyboard(),
+    }).catch(() => {});
+    return;
+  }
+
   const pending = pendingFiles.get(chatId);
 
   if (!pending) {
