@@ -578,45 +578,46 @@ async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
       .toBuffer();
   }
 
-  // ─── Step 1: try decreasing JPEG quality at max width ─────────────────────
-  const widthSteps   = [2048, 1600, 1280, 1024, 800];
-  const qualitySteps = [90, 80, 70, 60, 50, 40, 30];
+  const writeTemp = (buf: Buffer): string => {
+    const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+    fs.writeFileSync(tmpPath, buf);
+    return tmpPath;
+  };
 
-  for (const quality of qualitySteps) {
-    const buf = await sharp(imgBuffer)
-      .jpeg({ quality })
-      .resize({ width: 2048, withoutEnlargement: true })
+  // High-quality JPEG encoder that preserves text sharpness on manga pages.
+  // mozjpeg + 4:4:4 chroma + trellis = much crisper text at same file size.
+  const encode = (input: Buffer, quality: number, width?: number): Promise<Buffer> => {
+    let p = sharp(input);
+    if (width) p = p.resize({ width, withoutEnlargement: true, kernel: "lanczos3" });
+    return p
+      .jpeg({
+        quality,
+        mozjpeg: true,
+        chromaSubsampling: "4:4:4",
+        trellisQuantisation: true,
+        progressive: true,
+      })
       .toBuffer();
-    if (buf.length <= TG_PHOTO_MAX) {
-      const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
-      fs.writeFileSync(tmpPath, buf);
-      return tmpPath;
+  };
+
+  // ─── Step 1: native size, premium quality ladder (keeps text crisp) ──────
+  for (const q of [95, 92, 90, 87, 85]) {
+    const buf = await encode(imgBuffer, q);
+    if (buf.length <= TG_PHOTO_MAX) return writeTemp(buf);
+  }
+
+  // ─── Step 2: gentle downscale, still high quality ───────────────────────
+  // Keep width generous so text never falls below ~1600px on typical manga.
+  for (const width of [2560, 2200, 1920, 1700, 1500]) {
+    for (const q of [92, 88, 85, 82]) {
+      const buf = await encode(imgBuffer, q, width);
+      if (buf.length <= TG_PHOTO_MAX) return writeTemp(buf);
     }
   }
 
-  // ─── Step 2: reduce both width and quality together ────────────────────────
-  for (const width of widthSteps) {
-    for (const quality of [60, 50, 40, 30]) {
-      const buf = await sharp(imgBuffer)
-        .jpeg({ quality })
-        .resize({ width, withoutEnlargement: true })
-        .toBuffer();
-      if (buf.length <= TG_PHOTO_MAX) {
-        const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
-        fs.writeFileSync(tmpPath, buf);
-        return tmpPath;
-      }
-    }
-  }
-
-  // ─── Step 3: last resort — smallest acceptable size ───────────────────────
-  const buf = await sharp(imgBuffer)
-    .jpeg({ quality: 25 })
-    .resize({ width: 800, withoutEnlargement: true })
-    .toBuffer();
-  const tmpPath = path.join(os.tmpdir(), `tg_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
-  fs.writeFileSync(tmpPath, buf);
-  return tmpPath;
+  // ─── Step 3: last resort — smallest acceptable size ─────────────────────
+  const buf = await encode(imgBuffer, 75, 1280);
+  return writeTemp(buf);
 }
 
 // ─── Media Groups ─────────────────────────────────────────────────────────────
