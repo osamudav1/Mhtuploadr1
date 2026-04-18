@@ -632,10 +632,23 @@ async function sendImagesAsMediaGroups(
   const tempFiles: string[] = [];
 
   try {
+    // Save originals as DOCUMENTS (Telegram does NOT recompress documents,
+    // so text stays razor-sharp). Detect format from each buffer so .png stays .png.
+    const pad = String(images.length).length;
     for (let i = 0; i < images.length; i++) {
       ct.throwIfCancelled();
-      const imgPath = await compressForTelegram(images[i]);
-      tempFiles.push(imgPath);
+      const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
+      const ext = (meta.format === "png" ? "png"
+                : meta.format === "webp" ? "webp"
+                : meta.format === "gif"  ? "gif"
+                : "jpg");
+      const idx = String(i + 1).padStart(pad, "0");
+      const tmpPath = path.join(
+        os.tmpdir(),
+        `${baseName}_${idx}_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
+      );
+      fs.writeFileSync(tmpPath, images[i]);
+      tempFiles.push(tmpPath);
     }
 
     const groupSize = 10;
@@ -655,7 +668,7 @@ async function sendImagesAsMediaGroups(
       ).catch(() => { /* edit errors are harmless */ });
 
       const media = groupFiles.map((filePath) => ({
-        type: "photo" as const,
+        type: "document" as const,
         media: fs.createReadStream(filePath),
       }));
 
