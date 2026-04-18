@@ -667,7 +667,8 @@ async function sendImagesAsMediaGroups(
   images: Buffer[],
   baseName: string,
   statusMsgId: number,
-  ct: CancelToken
+  ct: CancelToken,
+  mode: "doc" | "photo" = "doc",
 ): Promise<void> {
   const tempFiles: string[] = [];
 
@@ -683,19 +684,27 @@ async function sendImagesAsMediaGroups(
     .slice(0, 40) || "chapter";
 
   try {
-    // Save originals as DOCUMENTS (Telegram does NOT recompress documents,
-    // so text stays razor-sharp). Detect format so .png stays .png, etc.
-    for (let i = 0; i < images.length; i++) {
-      ct.throwIfCancelled();
-      const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
-      const ext = (meta.format === "png" ? "png"
-                : meta.format === "webp" ? "webp"
-                : meta.format === "gif"  ? "gif"
-                : "jpg");
-      const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].${ext}`;
-      const tmpPath = path.join(tempDir, fileName);
-      fs.writeFileSync(tmpPath, images[i]);
-      tempFiles.push(tmpPath);
+    if (mode === "doc") {
+      // DOCUMENTS — Telegram does NOT recompress, text stays razor-sharp.
+      for (let i = 0; i < images.length; i++) {
+        ct.throwIfCancelled();
+        const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
+        const ext = (meta.format === "png" ? "png"
+                  : meta.format === "webp" ? "webp"
+                  : meta.format === "gif"  ? "gif"
+                  : "jpg");
+        const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].${ext}`;
+        const tmpPath = path.join(tempDir, fileName);
+        fs.writeFileSync(tmpPath, images[i]);
+        tempFiles.push(tmpPath);
+      }
+    } else {
+      // PHOTOS — compress to Telegram-friendly size (faster preview, smaller).
+      for (let i = 0; i < images.length; i++) {
+        ct.throwIfCancelled();
+        const compressedPath = await compressForTelegram(images[i]);
+        tempFiles.push(compressedPath);
+      }
     }
 
     const groupSize = 10;
@@ -714,7 +723,15 @@ async function sendImagesAsMediaGroups(
         { chat_id: chatId, message_id: statusMsgId }
       ).catch(() => { /* edit errors are harmless */ });
 
-      await callWithRetry(() => sendDocumentGroupDirect(targetChat(chatId), groupFiles), ct);
+      if (mode === "doc") {
+        await callWithRetry(() => sendDocumentGroupDirect(targetChat(chatId), groupFiles), ct);
+      } else {
+        const media = groupFiles.map((fp) => ({
+          type: "photo" as const,
+          media: fs.createReadStream(fp),
+        }));
+        await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
+      }
 
       if (g < totalGroups - 1) {
         // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
@@ -1007,7 +1024,8 @@ bot.on("document", async (msg) => {
       reply_markup: {
         inline_keyboard: [
           [{ text: "📄 PDF အဖြစ် ပြောင်းပြီး ပို့", callback_data: "send_pdf" }],
-          [{ text: "🖼 ပုံများ တိုက်ရိုက် ပို့ (10 ပုံစီ)", callback_data: "send_images" }],
+          [{ text: "🖼 Media Group (ပုံအဖြစ်)", callback_data: "send_images_photo" }],
+          [{ text: "📎 JPG Document (အရည်အသွေးပြည့်)", callback_data: "send_images_doc" }],
         ],
       },
     }
@@ -1141,7 +1159,8 @@ bot.on("callback_query", async (query) => {
     }
 
   // ── MHT → Images ─────────────────────────────────────────────────────────────
-  } else if (action === "send_images") {
+  } else if (action === "send_images_doc" || action === "send_images_photo") {
+    const sendMode: "doc" | "photo" = action === "send_images_doc" ? "doc" : "photo";
     await bot.editMessageText(`⏳ "${fileName}" ကို လုပ်ဆောင်နေသည်...`, {
       chat_id: chatId, message_id: messageId,
     });
@@ -1166,9 +1185,9 @@ bot.on("callback_query", async (query) => {
         { chat_id: chatId, message_id: messageId }
       );
 
-      await sendImagesAsMediaGroups(chatId, images, baseName, messageId, ct);
+      await sendImagesAsMediaGroups(chatId, images, baseName, messageId, ct, sendMode);
       await bot.deleteMessage(chatId, messageId).catch(() => {});
-      logger.info({ chatId, fileName, imageCount: images.length }, "Images sent as media groups");
+      logger.info({ chatId, fileName, imageCount: images.length, sendMode }, "Images sent as media groups");
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
