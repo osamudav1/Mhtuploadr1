@@ -636,10 +636,6 @@ async function sendImagesAsMediaGroups(
   const tempDir = path.join(os.tmpdir(), `mht_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // Burmese digits for the displayed file name (ပုံ၁, ပုံ၂, …)
-  const BMA_DIGITS = ["၀","၁","၂","၃","၄","၅","၆","၇","၈","၉"];
-  const toBma = (n: number) => String(n).split("").map((d) => BMA_DIGITS[Number(d)]).join("");
-
   try {
     // Save originals as DOCUMENTS (Telegram does NOT recompress documents,
     // so text stays razor-sharp). Detect format from each buffer so .png stays .png.
@@ -650,7 +646,7 @@ async function sendImagesAsMediaGroups(
                 : meta.format === "webp" ? "webp"
                 : meta.format === "gif"  ? "gif"
                 : "jpg");
-      const fileName = `ပုံ${toBma(i + 1)} [${baseName}].${ext}`;
+      const fileName = `poto ${i + 1} - ${baseName} - [ Manhwa by Luna ].${ext}`;
       const tmpPath = path.join(tempDir, fileName);
       fs.writeFileSync(tmpPath, images[i]);
       tempFiles.push(tmpPath);
