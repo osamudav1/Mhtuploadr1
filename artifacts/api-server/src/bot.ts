@@ -228,7 +228,47 @@ class CancelToken {
 // One active job per chatId
 const activeJobs = new Map<number, CancelToken>();
 
+// ─── Awaiting deletion state (PDF flow) ───────────────────────────────────────
+interface AwaitingDeletion {
+  images: Buffer[];
+  baseName: string;
+  fileName: string;
+  statusMsgId: number;
+  ct: CancelToken;
+}
+const awaitingDeletion = new Map<number, AwaitingDeletion>();
+
+function clearAwaitingDeletion(chatId: number) {
+  awaitingDeletion.delete(chatId);
+}
+
+function parseDeletionList(input: string, max: number): { keep: Set<number>; del: number[] } {
+  // Input examples: "3", "1,3,5", "2-7", "1,3,5-10,15"
+  // Returns 1-indexed deletion list and complement set (0-indexed indices to keep)
+  const delSet = new Set<number>();
+  const tokens = input.split(/[,\s]+/).filter(Boolean);
+  for (const tok of tokens) {
+    const range = tok.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (range) {
+      const a = parseInt(range[1]!, 10);
+      const b = parseInt(range[2]!, 10);
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      for (let i = lo; i <= hi; i++) {
+        if (i >= 1 && i <= max) delSet.add(i);
+      }
+    } else if (/^\d+$/.test(tok)) {
+      const n = parseInt(tok, 10);
+      if (n >= 1 && n <= max) delSet.add(n);
+    }
+  }
+  const keep = new Set<number>();
+  for (let i = 0; i < max; i++) if (!delSet.has(i + 1)) keep.add(i);
+  return { keep, del: [...delSet].sort((a, b) => a - b) };
+}
+
 function cancelExistingJob(chatId: number): boolean {
+  clearAwaitingDeletion(chatId);
   const existing = activeJobs.get(chatId);
   if (existing) {
     existing.cancel();
@@ -635,6 +675,68 @@ async function sendImagesAsMediaGroups(
   }
 }
 
+// ─── PDF finalization (after deletion choice) ────────────────────────────────
+
+async function finalizePdf(
+  chatId: number,
+  state: AwaitingDeletion,
+  keptIndices: number[] | null, // null = keep all
+): Promise<void> {
+  const { images, baseName, fileName, statusMsgId, ct } = state;
+  const finalImages = keptIndices === null ? images : keptIndices.map(i => images[i]!);
+  const removedCount = images.length - finalImages.length;
+  let pdfPath: string | null = null;
+
+  try {
+    if (finalImages.length === 0) {
+      await bot.editMessageText(`❌ ဖျက်ပြီးနောက် ပုံ မကျန်ပါ။ PDF လုပ်၍ မရပါ။`, {
+        chat_id: chatId, message_id: statusMsgId,
+      }).catch(() => {});
+      return;
+    }
+
+    await bot.editMessageText(
+      removedCount > 0
+        ? `⏳ ${removedCount} ပုံ ဖျက်ပြီး PDF ဖန်တီးနေသည် (ကျန် ${finalImages.length} ပုံ)...`
+        : `⏳ PDF ဖန်တီးနေသည် (${finalImages.length} ပုံ)...`,
+      { chat_id: chatId, message_id: statusMsgId }
+    ).catch(() => {});
+
+    pdfPath = await createPdfFromImages(finalImages, ct);
+
+    await callWithRetry(() =>
+      bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: statusMsgId }), ct
+    ).catch(() => {});
+
+    await callWithRetry(() =>
+      bot.sendDocument(
+        targetChat(chatId),
+        pdfPath!,
+        {},
+        { filename: `${baseName}.pdf`, contentType: "application/pdf" }
+      ), ct
+    );
+
+    await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
+    logger.info({ chatId, fileName, kept: finalImages.length, removed: removedCount }, "PDF sent");
+  } catch (err) {
+    if (err instanceof JobCancelledError) {
+      bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: statusMsgId })
+        .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
+    } else {
+      logger.error({ err, chatId, fileName }, "PDF send error");
+      bot.editMessageText(
+        `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
+        { chat_id: chatId, message_id: statusMsgId }
+      ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+    }
+  } finally {
+    if (pdfPath && fs.existsSync(pdfPath)) { try { fs.unlinkSync(pdfPath); } catch { /* ignore */ } }
+    clearAwaitingDeletion(chatId);
+    finishJob(chatId, ct);
+  }
+}
+
 // ─── Download helper ──────────────────────────────────────────────────────────
 
 async function downloadFile(
@@ -884,6 +986,29 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
+  // ── PDF deletion: Skip — keep all images and finalize ──────────────────────
+  if (action === "pdf_skip_delete") {
+    const state = awaitingDeletion.get(chatId);
+    if (!state) {
+      await bot.editMessageText(`⚠️ မရှိတော့ပါ။ ဖိုင်ကို ပြန်ပို့ပါ။`, {
+        chat_id: chatId, message_id: messageId,
+      }).catch(() => {});
+      return;
+    }
+    await finalizePdf(chatId, state, null);
+    return;
+  }
+
+  // ── PDF deletion: Cancel the whole PDF job ─────────────────────────────────
+  if (action === "pdf_cancel_delete") {
+    const wasRunning = cancelExistingJob(chatId);
+    await bot.editMessageText(
+      wasRunning ? `🛑 PDF လုပ်ငန်း ဖျက်လိုက်ပြီ။` : `🛑 ဖျက်လိုက်ပြီ။`,
+      { chat_id: chatId, message_id: messageId }
+    ).catch(() => {});
+    return;
+  }
+
   const pending = pendingFiles.get(chatId);
 
   if (!pending) {
@@ -899,13 +1024,12 @@ bot.on("callback_query", async (query) => {
 
   const ct = startJob(chatId);
 
-  // ── MHT → PDF ────────────────────────────────────────────────────────────────
+  // ── MHT → PDF (Step 1: download + extract, then ask for deletion list) ─────
   if (action === "send_pdf") {
     await bot.editMessageText(`⏳ "${fileName}" ကို လုပ်ဆောင်နေသည်...`, {
       chat_id: chatId, message_id: messageId,
     });
 
-    let pdfPath: string | null = null;
     try {
       const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct);
 
@@ -917,44 +1041,45 @@ bot.on("callback_query", async (query) => {
 
       if (images.length === 0) {
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
+        finishJob(chatId, ct);
         return;
       }
 
+      // Save state and prompt the owner to mark images for deletion
+      awaitingDeletion.set(chatId, {
+        images, baseName, fileName, statusMsgId: messageId, ct,
+      });
+
       await bot.editMessageText(
-        `⏳ ပုံ ${images.length} ပုံ တွေ့ပြီ။ PDF ဖန်တီးနေသည်...`,
-        { chat_id: chatId, message_id: messageId }
+        `📑 ပုံ ${images.length} ပုံ တွေ့ပြီ။\n\n` +
+        `❓ ဖျက်ချင်တဲ့ ပုံနံပါတ်ကို ရိုက်ပါ\n` +
+        `ဥပမာ: \`3\`  သို့မဟုတ် \`1,3,5\`  သို့မဟုတ် \`2-7\`  သို့မဟုတ် \`1,3,5-10,15\`\n\n` +
+        `ဖျက်စရာ မရှိရင် "⏭ Skip" ကို နှိပ်ပါ။`,
+        {
+          chat_id: chatId, message_id: messageId,
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "⏭ Skip — အားလုံး PDF လုပ်မည်", callback_data: "pdf_skip_delete" }],
+              [{ text: "🛑 ဖျက်ပါ", callback_data: "pdf_cancel_delete" }],
+            ],
+          },
+        }
       );
-
-      pdfPath = await createPdfFromImages(images, ct);
-
-      await callWithRetry(() =>
-        bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: messageId }), ct
-      ).catch(() => {});
-
-      await callWithRetry(() =>
-        bot.sendDocument(
-          targetChat(chatId),
-          pdfPath!,
-          {},
-          { filename: `${baseName}.pdf`, contentType: "application/pdf" }
-        ), ct
-      );
-
-      await bot.deleteMessage(chatId, messageId).catch(() => {});
-      logger.info({ chatId, fileName, imageCount: images.length }, "PDF sent");
+      // NOTE: we keep the job alive (do NOT call finishJob). It will be
+      // finalized by finalizePdf() after the owner replies.
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
           .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
       } else {
-        logger.error({ err, chatId, fileName }, "PDF send error");
+        logger.error({ err, chatId, fileName }, "PDF prep error");
         bot.editMessageText(
           `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
           { chat_id: chatId, message_id: messageId }
         ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
       }
-    } finally {
-      if (pdfPath && fs.existsSync(pdfPath)) { try { fs.unlinkSync(pdfPath); } catch { /* ignore */ } }
+      clearAwaitingDeletion(chatId);
       finishJob(chatId, ct);
     }
 
@@ -1006,6 +1131,44 @@ bot.on("callback_query", async (query) => {
 
 // ─── Non-owner catch-all ─────────────────────────────────────────────────────
 // Reply to any message from non-owners so they know the bot is private.
+// ─── Owner deletion-list text input (during PDF flow) ────────────────────────
+bot.on("message", async (msg) => {
+  if (!isOwner(msg.from?.id)) return;
+  const chatId = msg.chat.id;
+  const state = awaitingDeletion.get(chatId);
+  if (!state) return;
+  const text = msg.text?.trim();
+  if (!text) return;
+  if (text.startsWith("/")) return;        // commands handled elsewhere
+  if (msg.document) return;                // documents handled elsewhere
+
+  // Validate format: digits / commas / dashes / spaces only
+  if (!/^[\d,\s\-]+$/.test(text)) {
+    await bot.sendMessage(
+      chatId,
+      `⚠️ ပုံနံပါတ် format မမှန်ပါ။\nဥပမာ: \`3\`, \`1,3,5\`, \`2-7\`, \`1,3,5-10,15\``,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  const { keep, del } = parseDeletionList(text, state.images.length);
+  if (del.length === 0) {
+    await bot.sendMessage(
+      chatId,
+      `⚠️ ဖျက်စရာ ပုံ မရှိပါ (1 မှ ${state.images.length} အတွင်း ထည့်ပါ)။`
+    );
+    return;
+  }
+
+  await bot.sendMessage(
+    chatId,
+    `✅ ဖျက်မည့်ပုံ ${del.length} ပုံ: ${del.slice(0, 30).join(", ")}${del.length > 30 ? "…" : ""}`
+  );
+
+  await finalizePdf(chatId, state, [...keep].sort((a, b) => a - b));
+});
+
 bot.on("message", (msg) => {
   if (isOwner(msg.from?.id)) return;
   bot.sendMessage(msg.chat.id, "🔒 ဤ bot သည် private use ဖြစ်သောကြောင့် သင်အသုံးမပြုနိုင်ပါ။");
