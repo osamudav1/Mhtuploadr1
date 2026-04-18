@@ -629,19 +629,22 @@ async function sendImagesAsMediaGroups(
   statusMsgId: number,
   ct: CancelToken
 ): Promise<void> {
-  // Each file: { path on disk (safe ASCII) , display name shown in Telegram }
-  type Entry = { diskPath: string; displayName: string; mime: string };
-  const entries: Entry[] = [];
+  const tempFiles: string[] = [];
 
-  // Unique scratch dir for this job
+  // Unique scratch dir → lets each file have its full pretty display name on disk.
   const tempDir = path.join(os.tmpdir(), `mht_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
+  // Sanitize baseName for use in a filename: drop filesystem-illegal chars and
+  // truncate so the final filename stays comfortably short for HTTP headers.
+  const safeBase = baseName
+    .replace(/[\\/:*?"<>|\r\n\t]/g, "")
+    .trim()
+    .slice(0, 40) || "chapter";
+
   try {
     // Save originals as DOCUMENTS (Telegram does NOT recompress documents,
-    // so text stays razor-sharp). Disk name = safe ASCII to keep multipart
-    // form-data field naming bullet-proof; the pretty display name is set
-    // via fileOptions.filename when sending.
+    // so text stays razor-sharp). Detect format so .png stays .png, etc.
     for (let i = 0; i < images.length; i++) {
       ct.throwIfCancelled();
       const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
@@ -649,62 +652,46 @@ async function sendImagesAsMediaGroups(
                 : meta.format === "webp" ? "webp"
                 : meta.format === "gif"  ? "gif"
                 : "jpg");
-      const mime = ext === "png"  ? "image/png"
-                 : ext === "webp" ? "image/webp"
-                 : ext === "gif"  ? "image/gif"
-                 : "image/jpeg";
-      const diskPath = path.join(tempDir, `${i}.${ext}`);
-      fs.writeFileSync(diskPath, images[i]);
-      entries.push({
-        diskPath,
-        displayName: `poto ${i + 1} - ${baseName} - [ Manhwa by Luna ].${ext}`,
-        mime,
-      });
+      const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].${ext}`;
+      const tmpPath = path.join(tempDir, fileName);
+      fs.writeFileSync(tmpPath, images[i]);
+      tempFiles.push(tmpPath);
     }
 
-    // Send documents ONE AT A TIME with controlled concurrency.
-    // sendMediaGroup with documents has flaky multipart handling on some
-    // local-bot-api versions, while single sendDocument is rock-solid.
-    const concurrency = 4;
-    let nextIdx = 0;
-    let sentCount = 0;
-    let lastStatus = Date.now();
+    const groupSize = 10;
+    const totalGroups = Math.ceil(images.length / groupSize);
 
-    const sendOne = async (idx: number): Promise<void> => {
-      const e = entries[idx]!;
-      await callWithRetry(() =>
-        bot.sendDocument(
-          targetChat(chatId),
-          fs.createReadStream(e.diskPath),
-          {},
-          { filename: e.displayName, contentType: e.mime }
-        ),
-        ct
-      );
-      sentCount++;
-      // Throttle status edits — at most once per 1.2s
-      if (Date.now() - lastStatus > 1200) {
-        lastStatus = Date.now();
-        bot.editMessageText(
-          `⏳ ပို့နေသည်... ${sentCount}/${entries.length} ပုံ`,
-          { chat_id: chatId, message_id: statusMsgId }
-        ).catch(() => {});
+    for (let g = 0; g < totalGroups; g++) {
+      ct.throwIfCancelled();
+
+      const start = g * groupSize;
+      const end = Math.min(start + groupSize, images.length);
+      const groupFiles = tempFiles.slice(start, end);
+
+      // Update status every group so user sees real progress
+      bot.editMessageText(
+        `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
+        { chat_id: chatId, message_id: statusMsgId }
+      ).catch(() => { /* edit errors are harmless */ });
+
+      const media = groupFiles.map((filePath) => ({
+        type: "document" as const,
+        media: fs.createReadStream(filePath),
+      }));
+
+      await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
+
+      if (g < totalGroups - 1) {
+        // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
+        await new Promise<void>((res, rej) => {
+          const t = setTimeout(res, 1500);
+          ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
+        }).finally(() => ct.unregisterChild());
       }
-    };
-
-    const worker = async (): Promise<void> => {
-      while (true) {
-        ct.throwIfCancelled();
-        const myIdx = nextIdx++;
-        if (myIdx >= entries.length) return;
-        await sendOne(myIdx);
-      }
-    };
-
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    }
   } finally {
-    for (const e of entries) {
-      try { if (fs.existsSync(e.diskPath)) fs.unlinkSync(e.diskPath); } catch { /* ignore */ }
+    for (const f of tempFiles) {
+      try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch { /* ignore */ }
     }
     try { fs.rmdirSync(tempDir); } catch { /* ignore */ }
   }
