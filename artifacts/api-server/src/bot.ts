@@ -629,16 +629,19 @@ async function sendImagesAsMediaGroups(
   statusMsgId: number,
   ct: CancelToken
 ): Promise<void> {
-  const tempFiles: string[] = [];
+  // Each file: { path on disk (safe ASCII) , display name shown in Telegram }
+  type Entry = { diskPath: string; displayName: string; mime: string };
+  const entries: Entry[] = [];
 
-  // Unique scratch dir → lets the files themselves use clean display names
-  // like  ပုံ၁ [Manhwa by Luna].jpg  while still being unique on disk.
+  // Unique scratch dir for this job
   const tempDir = path.join(os.tmpdir(), `mht_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
   try {
     // Save originals as DOCUMENTS (Telegram does NOT recompress documents,
-    // so text stays razor-sharp). Detect format from each buffer so .png stays .png.
+    // so text stays razor-sharp). Disk name = safe ASCII to keep multipart
+    // form-data field naming bullet-proof; the pretty display name is set
+    // via fileOptions.filename when sending.
     for (let i = 0; i < images.length; i++) {
       ct.throwIfCancelled();
       const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
@@ -646,10 +649,17 @@ async function sendImagesAsMediaGroups(
                 : meta.format === "webp" ? "webp"
                 : meta.format === "gif"  ? "gif"
                 : "jpg");
-      const fileName = `poto ${i + 1} - ${baseName} - [ Manhwa by Luna ].${ext}`;
-      const tmpPath = path.join(tempDir, fileName);
-      fs.writeFileSync(tmpPath, images[i]);
-      tempFiles.push(tmpPath);
+      const mime = ext === "png"  ? "image/png"
+                 : ext === "webp" ? "image/webp"
+                 : ext === "gif"  ? "image/gif"
+                 : "image/jpeg";
+      const diskPath = path.join(tempDir, `${i}.${ext}`);
+      fs.writeFileSync(diskPath, images[i]);
+      entries.push({
+        diskPath,
+        displayName: `poto ${i + 1} - ${baseName} - [ Manhwa by Luna ].${ext}`,
+        mime,
+      });
     }
 
     const groupSize = 10;
@@ -660,7 +670,7 @@ async function sendImagesAsMediaGroups(
 
       const start = g * groupSize;
       const end = Math.min(start + groupSize, images.length);
-      const groupFiles = tempFiles.slice(start, end);
+      const groupEntries = entries.slice(start, end);
 
       // Update status every group so user sees real progress
       bot.editMessageText(
@@ -668,12 +678,13 @@ async function sendImagesAsMediaGroups(
         { chat_id: chatId, message_id: statusMsgId }
       ).catch(() => { /* edit errors are harmless */ });
 
-      const media = groupFiles.map((filePath) => ({
+      const media = groupEntries.map((e) => ({
         type: "document" as const,
-        media: fs.createReadStream(filePath),
+        media: fs.createReadStream(e.diskPath),
+        fileOptions: { filename: e.displayName, contentType: e.mime },
       }));
 
-      await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
+      await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media as any), ct);
 
       if (g < totalGroups - 1) {
         // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
@@ -684,8 +695,8 @@ async function sendImagesAsMediaGroups(
       }
     }
   } finally {
-    for (const f of tempFiles) {
-      try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch { /* ignore */ }
+    for (const e of entries) {
+      try { if (fs.existsSync(e.diskPath)) fs.unlinkSync(e.diskPath); } catch { /* ignore */ }
     }
     try { fs.rmdirSync(tempDir); } catch { /* ignore */ }
   }
