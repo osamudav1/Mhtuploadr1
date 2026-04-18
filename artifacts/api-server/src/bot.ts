@@ -631,10 +631,18 @@ async function sendImagesAsMediaGroups(
 ): Promise<void> {
   const tempFiles: string[] = [];
 
+  // Unique scratch dir → lets the files themselves use clean display names
+  // like  ပုံ၁ [Manhwa by Luna].jpg  while still being unique on disk.
+  const tempDir = path.join(os.tmpdir(), `mht_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  // Burmese digits for the displayed file name (ပုံ၁, ပုံ၂, …)
+  const BMA_DIGITS = ["၀","၁","၂","၃","၄","၅","၆","၇","၈","၉"];
+  const toBma = (n: number) => String(n).split("").map((d) => BMA_DIGITS[Number(d)]).join("");
+
   try {
     // Save originals as DOCUMENTS (Telegram does NOT recompress documents,
     // so text stays razor-sharp). Detect format from each buffer so .png stays .png.
-    const pad = String(images.length).length;
     for (let i = 0; i < images.length; i++) {
       ct.throwIfCancelled();
       const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
@@ -642,11 +650,8 @@ async function sendImagesAsMediaGroups(
                 : meta.format === "webp" ? "webp"
                 : meta.format === "gif"  ? "gif"
                 : "jpg");
-      const idx = String(i + 1).padStart(pad, "0");
-      const tmpPath = path.join(
-        os.tmpdir(),
-        `${baseName}_${idx}_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
-      );
+      const fileName = `ပုံ${toBma(i + 1)} [${baseName}].${ext}`;
+      const tmpPath = path.join(tempDir, fileName);
       fs.writeFileSync(tmpPath, images[i]);
       tempFiles.push(tmpPath);
     }
@@ -686,6 +691,7 @@ async function sendImagesAsMediaGroups(
     for (const f of tempFiles) {
       try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch { /* ignore */ }
     }
+    try { fs.rmdirSync(tempDir); } catch { /* ignore */ }
   }
 }
 
