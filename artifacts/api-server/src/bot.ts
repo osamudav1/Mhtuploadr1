@@ -662,38 +662,46 @@ async function sendImagesAsMediaGroups(
       });
     }
 
-    const groupSize = 10;
-    const totalGroups = Math.ceil(images.length / groupSize);
+    // Send documents ONE AT A TIME with controlled concurrency.
+    // sendMediaGroup with documents has flaky multipart handling on some
+    // local-bot-api versions, while single sendDocument is rock-solid.
+    const concurrency = 4;
+    let nextIdx = 0;
+    let sentCount = 0;
+    let lastStatus = Date.now();
 
-    for (let g = 0; g < totalGroups; g++) {
-      ct.throwIfCancelled();
-
-      const start = g * groupSize;
-      const end = Math.min(start + groupSize, images.length);
-      const groupEntries = entries.slice(start, end);
-
-      // Update status every group so user sees real progress
-      bot.editMessageText(
-        `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
-        { chat_id: chatId, message_id: statusMsgId }
-      ).catch(() => { /* edit errors are harmless */ });
-
-      const media = groupEntries.map((e) => ({
-        type: "document" as const,
-        media: fs.createReadStream(e.diskPath),
-        fileOptions: { filename: e.displayName, contentType: e.mime },
-      }));
-
-      await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media as any), ct);
-
-      if (g < totalGroups - 1) {
-        // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
-        await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, 1500);
-          ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
-        }).finally(() => ct.unregisterChild());
+    const sendOne = async (idx: number): Promise<void> => {
+      const e = entries[idx]!;
+      await callWithRetry(() =>
+        bot.sendDocument(
+          targetChat(chatId),
+          fs.createReadStream(e.diskPath),
+          {},
+          { filename: e.displayName, contentType: e.mime }
+        ),
+        ct
+      );
+      sentCount++;
+      // Throttle status edits — at most once per 1.2s
+      if (Date.now() - lastStatus > 1200) {
+        lastStatus = Date.now();
+        bot.editMessageText(
+          `⏳ ပို့နေသည်... ${sentCount}/${entries.length} ပုံ`,
+          { chat_id: chatId, message_id: statusMsgId }
+        ).catch(() => {});
       }
-    }
+    };
+
+    const worker = async (): Promise<void> => {
+      while (true) {
+        ct.throwIfCancelled();
+        const myIdx = nextIdx++;
+        if (myIdx >= entries.length) return;
+        await sendOne(myIdx);
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
   } finally {
     for (const e of entries) {
       try { if (fs.existsSync(e.diskPath)) fs.unlinkSync(e.diskPath); } catch { /* ignore */ }
