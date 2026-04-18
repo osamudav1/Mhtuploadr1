@@ -58,6 +58,7 @@ async function startLocalBotApiServer(): Promise<void> {
         `--http-port=${LOCAL_BOT_API_PORT}`,
         `--dir=${workDir}`,
         `--temp-dir=${os.tmpdir()}`,
+        `--verbosity=2`,
       ],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
@@ -67,6 +68,8 @@ async function startLocalBotApiServer(): Promise<void> {
 
     const onData = (chunk: Buffer) => {
       const line = chunk.toString();
+      // Forward all server output to our logger so we can see request errors
+      process.stderr.write(`[tg-api] ${line}`);
       if (line.includes("Start to receive") || line.includes("listening") || line.includes("LISTENING")) {
         if (!ready) {
           ready = true;
