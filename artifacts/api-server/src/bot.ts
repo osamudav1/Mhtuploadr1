@@ -2,6 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import PDFDocument from "pdfkit";
 import sharp from "sharp";
 import axios from "axios";
+import FormData from "form-data";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -625,6 +626,42 @@ async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
 
 // ─── Media Groups ─────────────────────────────────────────────────────────────
 
+// Direct sendMediaGroup (documents) bypassing node-telegram-bot-api.
+// The library puts `media` in the URL query string, which the local Bot API
+// server cannot parse for sendMediaGroup — causing a "Wrong file identifier"
+// error. Building the multipart body manually with everything inside fixes it.
+async function sendDocumentGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
+  const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
+  const url = `${baseApiUrl}/bot${token}/sendMediaGroup`;
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  const media = filePaths.map((_, i) => ({ type: "document", media: `attach://${i}` }));
+  form.append("media", JSON.stringify(media));
+  filePaths.forEach((fp, i) => {
+    form.append(String(i), fs.createReadStream(fp), {
+      filename: path.basename(fp),
+      contentType: "application/octet-stream",
+    });
+  });
+
+  try {
+    await axios.post(url, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 120_000,
+    });
+  } catch (err: any) {
+    const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
+    const status = err?.response?.status;
+    const wrapped: any = new Error(`ETELEGRAM: ${status ?? ""} ${desc}`.trim());
+    wrapped.code = "ETELEGRAM";
+    wrapped.response = err?.response;
+    throw wrapped;
+  }
+}
+
 async function sendImagesAsMediaGroups(
   chatId: number,
   images: Buffer[],
@@ -677,12 +714,7 @@ async function sendImagesAsMediaGroups(
         { chat_id: chatId, message_id: statusMsgId }
       ).catch(() => { /* edit errors are harmless */ });
 
-      const media = groupFiles.map((filePath) => ({
-        type: "document" as const,
-        media: fs.createReadStream(filePath),
-      }));
-
-      await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
+      await callWithRetry(() => sendDocumentGroupDirect(targetChat(chatId), groupFiles), ct);
 
       if (g < totalGroups - 1) {
         // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
