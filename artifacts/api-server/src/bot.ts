@@ -329,10 +329,32 @@ function finishJob(chatId: number, token: CancelToken) {
 
 // ─── 429 Retry Helper ─────────────────────────────────────────────────────────
 
+/** Extract retry_after seconds from any Telegram error shape (node-telegram-bot-api or axios). */
+function extractRetryAfter(err: any): number | undefined {
+  // node-telegram-bot-api: err.response.body.parameters.retry_after
+  const fromBody = err?.response?.body?.parameters?.retry_after;
+  if (typeof fromBody === "number") return fromBody;
+
+  // axios direct Telegram API: err.response.data.parameters.retry_after
+  const fromData = err?.response?.data?.parameters?.retry_after;
+  if (typeof fromData === "number") return fromData;
+
+  // HTTP status code only (no body parsed) — node-telegram-bot-api statusCode
+  if (err?.response?.statusCode === 429) return 30;
+  // axios status
+  if (err?.response?.status === 429) return 30;
+
+  // Parse from error message: "retry after 3"
+  const match = (err?.message ?? "").match(/retry after (\d+)/i);
+  if (match) return parseInt(match[1], 10);
+
+  return undefined;
+}
+
 async function callWithRetry<T>(
   fn: () => Promise<T>,
   ct?: CancelToken,
-  maxAttempts = 6
+  maxAttempts = 8
 ): Promise<T> {
   let lastErr: any;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -342,10 +364,7 @@ async function callWithRetry<T>(
       lastErr = err;
       if (ct?.cancelled) throw new JobCancelledError();
 
-      // 429 rate limit
-      const retryAfterSec: number | undefined =
-        err?.response?.body?.parameters?.retry_after ??
-        (err?.response?.statusCode === 429 ? 30 : undefined);
+      const retryAfterSec = extractRetryAfter(err);
 
       // Transient network / timeout errors
       const code = err?.code || err?.cause?.code || err?.response?.code;
@@ -362,6 +381,7 @@ async function callWithRetry<T>(
 
       let waitMs = 0;
       if (retryAfterSec !== undefined) {
+        // Wait the required time + 1s buffer
         waitMs = (retryAfterSec + 1) * 1000;
         logger.warn({ retryAfterSec, attempt }, `429 rate limit — waiting ${retryAfterSec}s before retry`);
       } else if (isTransient) {
@@ -770,9 +790,9 @@ async function sendImagesAsMediaGroups(
       }
 
       if (g < totalGroups - 1) {
-        // 1.5s delay between groups to avoid rate limits (429 retry handles edge cases)
+        // 3s delay between groups to stay under Telegram rate limits
         await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, 1500);
+          const t = setTimeout(res, 3000);
           ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
         }).finally(() => ct.unregisterChild());
       }
