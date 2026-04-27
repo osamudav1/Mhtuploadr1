@@ -324,7 +324,8 @@ async function callWithRetry<T>(
       const isTransient =
         code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT" ||
         code === "ECONNRESET" || code === "ECONNREFUSED" ||
-        code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "EPIPE" ||
+        code === "ECONNABORTED" || code === "ENOTFOUND" ||
+        code === "EAI_AGAIN" || code === "EPIPE" ||
         code === "EFATAL" || err?.name === "EFATAL" || err?.name === "EPARSE" ||
         msg.includes("etimedout") || msg.includes("socket hang up") ||
         msg.includes("network") || msg.includes("timeout") ||
@@ -655,7 +656,7 @@ async function sendDocumentGroupDirect(chatId: number, filePaths: string[]): Pro
       headers: form.getHeaders(),
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
-      timeout: 120_000,
+      timeout: 5 * 60_000, // 5 minutes — large document groups can be slow
     });
   } catch (err: any) {
     const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
@@ -998,13 +999,15 @@ bot.on("document", async (msg) => {
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: statusMsgId })
-          .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
+          .catch(() => {});
+        bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။").catch(() => {});
       } else {
+        const errMsg = err instanceof Error ? err.message : String(err);
         logger.error({ err, chatId, fileName }, "PDF processing error");
-        bot.editMessageText(
-          `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
-          { chat_id: chatId, message_id: statusMsgId }
-        ).catch(() => bot.sendMessage(chatId, "❌ PDF လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+        bot.editMessageText(`❌ အမှားဖြစ်သည်:\n${errMsg}`, { chat_id: chatId, message_id: statusMsgId })
+          .catch(() => {});
+        // Always also send a new message so user sees it even if edit fails
+        bot.sendMessage(chatId, `❌ PDF လုပ်ဆောင်ရာ အမှားဖြစ်သည်:\n${errMsg.slice(0, 200)}`).catch(() => {});
       }
     } finally {
       finishJob(chatId, ct);
@@ -1196,13 +1199,15 @@ bot.on("callback_query", async (query) => {
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
-          .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။"));
+          .catch(() => {});
+        bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။").catch(() => {});
       } else {
+        const errMsg = err instanceof Error ? err.message : String(err);
         logger.error({ err, chatId, fileName }, "Images send error");
-        bot.editMessageText(
-          `❌ အမှားဖြစ်သည်:\n${err instanceof Error ? err.message : String(err)}`,
-          { chat_id: chatId, message_id: messageId }
-        ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
+        bot.editMessageText(`❌ အမှားဖြစ်သည်:\n${errMsg}`, { chat_id: chatId, message_id: messageId })
+          .catch(() => {});
+        // Always also send a new message so user sees it even if edit fails
+        bot.sendMessage(chatId, `❌ ပုံများ ပို့ရာ အမှားဖြစ်သည်:\n${errMsg.slice(0, 200)}`).catch(() => {});
       }
     } finally {
       finishJob(chatId, ct);
