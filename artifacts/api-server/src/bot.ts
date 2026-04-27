@@ -138,16 +138,21 @@ export async function initBot() {
     try {
       await startLocalBotApiServer();
       // Wait for server readiness
+      let serverReady = false;
       let attempts = 0;
       while (attempts < 15) {
-        if (await isLocalServerReady()) break;
+        if (await isLocalServerReady()) { serverReady = true; break; }
         await new Promise(r => setTimeout(r, 1000));
         attempts++;
       }
-      // Switch bot to use local server — library uses options.baseApiUrl
-      (bot as any).options.baseApiUrl = LOCAL_BOT_API_BASE;
-      usingLocalServer = true;
-      logger.info({ port: LOCAL_BOT_API_PORT }, "Local bot API server ready — 2 GB file limit active");
+      // Only switch to local server if it actually started and responded
+      if (serverReady) {
+        (bot as any).options.baseApiUrl = LOCAL_BOT_API_BASE;
+        usingLocalServer = true;
+        logger.info({ port: LOCAL_BOT_API_PORT }, "Local bot API server ready — 2 GB file limit active");
+      } else {
+        logger.warn("Local bot API server did not become ready in time — falling back to standard 20 MB limit");
+      }
     } catch (err) {
       logger.warn({ err }, "Local bot API server failed to start — continuing with standard 20 MB limit");
     }
