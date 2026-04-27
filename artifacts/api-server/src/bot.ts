@@ -888,6 +888,7 @@ bot.onText(/\/start/, (msg) => {
       `🗂 .mht / .mhtml ဖိုင် → PDF သို့မဟုတ် ပုံများ ရွေးချယ်နိုင်သည်\n\n` +
       `ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ။\n\n` +
       `/channel — Storage channel ON/OFF ပြောင်းရန်\n` +
+      `/status — Local server / file limit အခြေအနေ ကြည့်ရန်\n` +
       `/cancel — လုပ်ဆောင်နေသော task ကို ဖျက်ရန်`
   );
 });
@@ -918,6 +919,34 @@ bot.onText(/\/cancel/, async (msg) => {
   } else {
     bot.sendMessage(chatId, "⚠️ ဖျက်စရာ task မရှိပါ။");
   }
+});
+
+// ─── /status — show server status ────────────────────────────────────────────
+bot.onText(/\/status/, async (msg) => {
+  if (!isOwner(msg.from?.id)) return;
+  const hasCredentials = !!(process.env["TELEGRAM_API_ID"] && process.env["TELEGRAM_API_HASH"]);
+  const hasBinary = !!(TG_BOT_API_BIN && fs.existsSync(TG_BOT_API_BIN));
+
+  const serverStatus = usingLocalServer
+    ? `🟢 Local server: ရပ်နေသည် (${LOCAL_BOT_API_PORT}) — 2 GB limit active`
+    : `🔴 Local server: မရပ်ပါ — 20 MB limit သာ`;
+
+  const binaryStatus = hasBinary
+    ? `✅ Binary: ${TG_BOT_API_BIN}`
+    : `❌ Binary: မတွေ့ပါ (Docker rebuild လိုနိုင်သည်)`;
+
+  const credStatus = hasCredentials
+    ? `✅ API credentials: ထည့်ထားပြီ`
+    : `❌ API credentials: မထည့်ရသေးပါ (TELEGRAM_API_ID / TELEGRAM_API_HASH)`;
+
+  const localProc = usingLocalServer
+    ? `✅ Process: running`
+    : (localApiProcess ? `⚠️ Process: ရှိသည် သို့သော် ready မဟုတ်` : `❌ Process: မရှိပါ`);
+
+  bot.sendMessage(
+    msg.chat.id,
+    `📊 Bot Status\n\n${serverStatus}\n${binaryStatus}\n${credStatus}\n${localProc}`,
+  );
 });
 
 // ─── /channel — toggle storage channel ON/OFF ────────────────────────────────
@@ -974,10 +1003,23 @@ bot.on("document", async (msg) => {
   if (fileSize > TG_DOWNLOAD_MAX) {
     const sizeMB = (fileSize / 1024 / 1024).toFixed(1);
     const limitMB = usingLocalServer ? "2000" : "20";
+    const hasCredentials = !!(process.env["TELEGRAM_API_ID"] && process.env["TELEGRAM_API_HASH"]);
+    const hasBinary = !!(TG_BOT_API_BIN && fs.existsSync(TG_BOT_API_BIN));
+
+    let hint = "";
+    if (!usingLocalServer) {
+      if (!hasCredentials) {
+        hint = "\n\n⚙️ ကြီးသောဖိုင် (300MB အထိ) ပို့ဖို့ Render dashboard မှာ TELEGRAM_API_ID နဲ့ TELEGRAM_API_HASH ထည့်ရန် လိုသည်။";
+      } else if (!hasBinary) {
+        hint = "\n\n⚙️ telegram-bot-api binary မတွေ့ပါ — Docker image ကို rebuild လုပ်ရန် လိုနိုင်သည်။";
+      } else {
+        hint = "\n\n⚙️ Local server start မဖြစ်ပါ — /status ဖြင့် စစ်ကြည့်ပါ။";
+      }
+    }
+
     bot.sendMessage(
       chatId,
-      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိ၍ ${limitMB} MB ကန့်သတ်ချက်ကျော်နေပါသည်။\n\n` +
-      `💡 chapter ကို ပိုင်းခြားပြီး ပို့ပါ။`
+      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိ၍ ${limitMB} MB ကန့်သတ်ချက်ကျော်နေပါသည်။${hint}`
     );
     return;
   }
