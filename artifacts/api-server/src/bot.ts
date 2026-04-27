@@ -7,7 +7,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn, ChildProcess } from "child_process";
-import { logger } from "./lib/logger";
+import { logger } from "./lib/logger.js";
+import { isMtProtoAvailable, getMtProtoClient, downloadViaMtProto } from "./gramjsClient.js";
 
 const token = process.env["TELEGRAM_BOT_TOKEN"];
 if (!token) throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");
@@ -175,6 +176,15 @@ export async function initBot() {
     } catch (err) {
       logger.warn({ err }, "Local bot API server failed to start — continuing with standard 20 MB limit");
     }
+  }
+
+  // Pre-connect MTProto (gramjs) client in background — enables large file download without binary
+  if (isMtProtoAvailable()) {
+    getMtProtoClient().catch(err => {
+      logger.warn({ err }, "MTProto pre-connect failed — will retry on first large file");
+    });
+  } else {
+    logger.warn("TELEGRAM_API_ID/TELEGRAM_API_HASH not set — large file support disabled (20 MB limit)");
   }
 
   // Clear any stale webhook first (ensures polling mode works cleanly)
@@ -380,6 +390,7 @@ interface PendingFile {
   fileId: string;
   fileName: string;
   timestamp: number;
+  origMessageId: number;
 }
 const pendingFiles = new Map<number, PendingFile>();
 
@@ -843,7 +854,8 @@ async function downloadFile(
   fileName: string,
   chatId: number,
   statusMsgId: number,
-  ct: CancelToken
+  ct: CancelToken,
+  origMessageId?: number
 ): Promise<Buffer> {
   ct.throwIfCancelled();
   await bot.editMessageText(
@@ -851,29 +863,67 @@ async function downloadFile(
     { chat_id: chatId, message_id: statusMsgId }
   );
 
-  const fileInfo = await bot.getFile(fileId);
+  // ── Try standard Bot API getFile first (works up to 20 MB) ──────────────────
+  let fileInfo: TelegramBot.File | null = null;
+  try {
+    fileInfo = await bot.getFile(fileId);
+  } catch (err: any) {
+    // Files >20 MB fail getFile on the standard API — expected
+    logger.warn({ err: err?.message }, "getFile failed (file may be >20 MB), will try MTProto");
+  }
   ct.throwIfCancelled();
 
-  if (usingLocalServer && fileInfo.file_path) {
-    // Local server (--local mode) stores files on disk — read directly
-    const localPath = fileInfo.file_path;
-    return await new Promise<Buffer>((resolve, reject) => {
-      fs.readFile(localPath, (err, data) => {
-        if (err) reject(err);
-        else resolve(data);
+  if (fileInfo?.file_path) {
+    if (usingLocalServer) {
+      // Local server (--local mode) stores files on disk — read directly
+      return await new Promise<Buffer>((resolve, reject) => {
+        fs.readFile(fileInfo!.file_path!, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
       });
+    }
+    // Standard cloud API — download via HTTP
+    const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
+    const fileUrl = `${baseApiUrl}/file/bot${token}/${fileInfo.file_path}`;
+    const response = await axios.get(fileUrl, {
+      responseType: "arraybuffer",
+      maxContentLength: 2000 * 1024 * 1024,
+      signal: ct.signal,
     });
+    return Buffer.from(response.data);
   }
 
-  // Standard cloud API — download via HTTP
-  const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
-  const fileUrl = `${baseApiUrl}/file/bot${token}/${fileInfo.file_path}`;
-  const response = await axios.get(fileUrl, {
-    responseType: "arraybuffer",
-    maxContentLength: 2000 * 1024 * 1024,
-    signal: ct.signal,
-  });
-  return Buffer.from(response.data);
+  // ── Fallback: MTProto via gramjs (no binary needed, needs API_ID + API_HASH) ─
+  if (origMessageId && isMtProtoAvailable()) {
+    await bot.editMessageText(
+      `⏳ "${fileName}"\nMTProto ဖြင့် ဒေါင်းလုပ် ဆွဲနေသည်...`,
+      { chat_id: chatId, message_id: statusMsgId }
+    );
+
+    let lastPct = -1;
+    const buf = await downloadViaMtProto(chatId, origMessageId, async (dl, total) => {
+      if (total > 0) {
+        const pct = Math.floor((dl / total) * 100);
+        if (pct !== lastPct && pct % 10 === 0) {
+          lastPct = pct;
+          try {
+            await bot.editMessageText(
+              `⏳ "${fileName}"\nMTProto ဒေါင်းလုပ် ${pct}% (${(dl / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB)`,
+              { chat_id: chatId, message_id: statusMsgId }
+            );
+          } catch { /* ignore edit errors */ }
+        }
+      }
+    });
+    if (buf) return buf;
+  }
+
+  throw new Error(
+    isMtProtoAvailable()
+      ? "ဖိုင် download မဖြစ်ပါ (MTProto error — /status ဖြင့် စစ်ပါ)"
+      : "ဖိုင် download မဖြစ်ပါ — TELEGRAM_API_ID / TELEGRAM_API_HASH မထည့်ရသေးပါ"
+  );
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -927,25 +977,21 @@ bot.onText(/\/status/, async (msg) => {
   const hasCredentials = !!(process.env["TELEGRAM_API_ID"] && process.env["TELEGRAM_API_HASH"]);
   const hasBinary = !!(TG_BOT_API_BIN && fs.existsSync(TG_BOT_API_BIN));
 
-  const serverStatus = usingLocalServer
-    ? `🟢 Local server: ရပ်နေသည် (${LOCAL_BOT_API_PORT}) — 2 GB limit active`
-    : `🔴 Local server: မရပ်ပါ — 20 MB limit သာ`;
-
-  const binaryStatus = hasBinary
-    ? `✅ Binary: ${TG_BOT_API_BIN}`
-    : `❌ Binary: မတွေ့ပါ (Docker rebuild လိုနိုင်သည်)`;
+  const mtprotoStatus = isMtProtoAvailable()
+    ? `🟢 MTProto (gramjs): ရသည် — 2 GB limit active`
+    : `🔴 MTProto (gramjs): credentials မထည့်ရသေး`;
 
   const credStatus = hasCredentials
-    ? `✅ API credentials: ထည့်ထားပြီ`
-    : `❌ API credentials: မထည့်ရသေးပါ (TELEGRAM_API_ID / TELEGRAM_API_HASH)`;
+    ? `✅ API_ID / API_HASH: ထည့်ထားပြီ`
+    : `❌ API_ID / API_HASH: မထည့်ရသေးပါ`;
 
-  const localProc = usingLocalServer
-    ? `✅ Process: running`
-    : (localApiProcess ? `⚠️ Process: ရှိသည် သို့သော် ready မဟုတ်` : `❌ Process: မရှိပါ`);
+  const serverStatus = usingLocalServer
+    ? `🟢 Local binary server: ရပ်နေသည်`
+    : `⚫ Local binary server: မသုံးပါ`;
 
   bot.sendMessage(
     msg.chat.id,
-    `📊 Bot Status\n\n${serverStatus}\n${binaryStatus}\n${credStatus}\n${localProc}`,
+    `📊 Bot Status\n\n${mtprotoStatus}\n${credStatus}\n${serverStatus}`,
   );
 });
 
@@ -996,30 +1042,18 @@ bot.on("document", async (msg) => {
     document.mime_type === "application/pdf";
 
   // ── File size guard ───────────────────────────────────────────────────────────
-  // With local bot API server: up to 2000 MB. Without: 20 MB.
-  // usingLocalServer is set at module level when local bot API server starts successfully
-  const TG_DOWNLOAD_MAX = usingLocalServer ? 2000 * 1024 * 1024 : 20 * 1024 * 1024;
+  // usingLocalServer → up to 2 GB via local bot-api binary
+  // isMtProtoAvailable() → up to 2 GB via gramjs MTProto (no binary needed)
+  // otherwise → 20 MB standard limit
+  const canHandleLarge = usingLocalServer || isMtProtoAvailable();
+  const TG_DOWNLOAD_MAX = canHandleLarge ? 2000 * 1024 * 1024 : 20 * 1024 * 1024;
   const fileSize = document.file_size ?? 0;
   if (fileSize > TG_DOWNLOAD_MAX) {
     const sizeMB = (fileSize / 1024 / 1024).toFixed(1);
-    const limitMB = usingLocalServer ? "2000" : "20";
-    const hasCredentials = !!(process.env["TELEGRAM_API_ID"] && process.env["TELEGRAM_API_HASH"]);
-    const hasBinary = !!(TG_BOT_API_BIN && fs.existsSync(TG_BOT_API_BIN));
-
-    let hint = "";
-    if (!usingLocalServer) {
-      if (!hasCredentials) {
-        hint = "\n\n⚙️ ကြီးသောဖိုင် (300MB အထိ) ပို့ဖို့ Render dashboard မှာ TELEGRAM_API_ID နဲ့ TELEGRAM_API_HASH ထည့်ရန် လိုသည်။";
-      } else if (!hasBinary) {
-        hint = "\n\n⚙️ telegram-bot-api binary မတွေ့ပါ — Docker image ကို rebuild လုပ်ရန် လိုနိုင်သည်။";
-      } else {
-        hint = "\n\n⚙️ Local server start မဖြစ်ပါ — /status ဖြင့် စစ်ကြည့်ပါ။";
-      }
-    }
-
+    const hint = `\n\n⚙️ ကြီးသောဖိုင် (300MB အထိ) ပို့ဖို့ Render dashboard မှာ TELEGRAM_API_ID နဲ့ TELEGRAM_API_HASH ထည့်ပါ။`;
     bot.sendMessage(
       chatId,
-      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိ၍ ${limitMB} MB ကန့်သတ်ချက်ကျော်နေပါသည်။${hint}`
+      `❌ ဖိုင် "${fileName}" သည် ${sizeMB} MB ရှိ၍ 20 MB ကန့်သတ်ချက်ကျော်နေပါသည်။${hint}`
     );
     return;
   }
@@ -1033,7 +1067,7 @@ bot.on("document", async (msg) => {
     const baseName = path.basename(fileName, ".pdf");
 
     try {
-      const pdfBuffer = await downloadFile(document.file_id, fileName, chatId, statusMsgId, ct);
+      const pdfBuffer = await downloadFile(document.file_id, fileName, chatId, statusMsgId, ct, msg.message_id);
 
       await bot.editMessageText(`⏳ PDF ဖိုင်မှ ပုံများ ထုတ်နေသည်...`, {
         chat_id: chatId, message_id: statusMsgId,
@@ -1084,7 +1118,7 @@ bot.on("document", async (msg) => {
 
   // Cancel any running job before showing the keyboard
   cancelExistingJob(chatId);
-  pendingFiles.set(chatId, { fileId: document.file_id, fileName, timestamp: Date.now() });
+  pendingFiles.set(chatId, { fileId: document.file_id, fileName, timestamp: Date.now(), origMessageId: msg.message_id });
 
   await bot.sendMessage(
     chatId,
@@ -1163,7 +1197,7 @@ bot.on("callback_query", async (query) => {
   }
 
   pendingFiles.delete(chatId);
-  const { fileId, fileName } = pending;
+  const { fileId, fileName, origMessageId: origMsgId } = pending;
   const baseName = path.basename(fileName, path.extname(fileName));
 
   const ct = startJob(chatId);
@@ -1175,7 +1209,7 @@ bot.on("callback_query", async (query) => {
     });
 
     try {
-      const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct);
+      const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct, origMsgId);
 
       await bot.editMessageText(`⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
         chat_id: chatId, message_id: messageId,
@@ -1235,7 +1269,7 @@ bot.on("callback_query", async (query) => {
     });
 
     try {
-      const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct);
+      const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct, origMsgId);
 
       await bot.editMessageText(`⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
         chat_id: chatId, message_id: messageId,
