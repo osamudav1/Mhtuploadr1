@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: mht-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: singapore
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: STORAGE_CHANNEL_ID
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

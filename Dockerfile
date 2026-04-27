@@ -35,6 +35,7 @@ RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @workspace/api-server run build
 
 ENV NODE_ENV=production
-EXPOSE 8080
+ENV PORT=10000
+EXPOSE 10000
 
 CMD ["node", "--enable-source-maps", "/workspace/artifacts/api-server/dist/index.mjs"]
