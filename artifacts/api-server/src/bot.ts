@@ -29,6 +29,13 @@ const TG_BOT_API_BIN_CANDIDATES = [
 
 const TG_BOT_API_BIN = TG_BOT_API_BIN_CANDIDATES.find(p => fs.existsSync(p)) ?? "";
 
+// Log binary resolution at startup
+logger.info({
+  candidates: TG_BOT_API_BIN_CANDIDATES,
+  resolved: TG_BOT_API_BIN || "(not found)",
+  exists: TG_BOT_API_BIN ? fs.existsSync(TG_BOT_API_BIN) : false,
+}, "telegram-bot-api binary resolution");
+
 let localApiProcess: ChildProcess | null = null;
 let usingLocalServer = false;
 
@@ -41,10 +48,12 @@ async function startLocalBotApiServer(): Promise<void> {
     return;
   }
 
-  if (!fs.existsSync(TG_BOT_API_BIN)) {
-    logger.warn("telegram-bot-api binary not found — local bot API server disabled");
+  if (!TG_BOT_API_BIN || !fs.existsSync(TG_BOT_API_BIN)) {
+    logger.warn({ checked: TG_BOT_API_BIN_CANDIDATES }, "telegram-bot-api binary not found in any candidate path — local bot API server disabled");
     return;
   }
+
+  logger.info({ bin: TG_BOT_API_BIN, port: LOCAL_BOT_API_PORT }, "Starting local Telegram Bot API server");
 
   const workDir = path.join(os.tmpdir(), "tg-bot-api");
   fs.mkdirSync(workDir, { recursive: true });
@@ -65,15 +74,16 @@ async function startLocalBotApiServer(): Promise<void> {
     );
     localApiProcess = proc;
 
-    let ready = false;
+    let resolved = false;
+    let exited = false;
 
     const onData = (chunk: Buffer) => {
       const line = chunk.toString();
-      // Forward all server output to our logger so we can see request errors
+      // Forward all server output to our logger so we can see what's happening
       process.stderr.write(`[tg-api] ${line}`);
       if (line.includes("Start to receive") || line.includes("listening") || line.includes("LISTENING")) {
-        if (!ready) {
-          ready = true;
+        if (!resolved) {
+          resolved = true;
           resolve();
         }
       }
@@ -82,22 +92,30 @@ async function startLocalBotApiServer(): Promise<void> {
     proc.stderr?.on("data", onData);
 
     proc.on("error", (err) => {
-      logger.error({ err }, "Local bot API server error");
-      if (!ready) reject(err);
+      logger.error({ err, bin: TG_BOT_API_BIN }, "Local bot API server spawn error — binary may be incompatible");
+      if (!resolved) { resolved = true; reject(err); }
     });
 
-    proc.on("exit", (code) => {
-      logger.warn({ code }, "Local bot API server exited");
+    proc.on("exit", (code, signal) => {
+      exited = true;
       localApiProcess = null;
+      if (!resolved) {
+        logger.error({ code, signal, bin: TG_BOT_API_BIN }, "Local bot API server exited before becoming ready");
+        resolved = true;
+        reject(new Error(`telegram-bot-api exited with code ${code} before ready`));
+      } else {
+        logger.warn({ code, signal }, "Local bot API server exited");
+      }
     });
 
-    // Give it up to 10s to start
+    // Give it up to 30s to start before proceeding
     setTimeout(() => {
-      if (!ready) {
-        ready = true;
-        resolve(); // resolve anyway — server might still be starting
+      if (!resolved && !exited) {
+        logger.info("Local bot API server startup timeout reached — proceeding to readiness probe");
+        resolved = true;
+        resolve();
       }
-    }, 10_000);
+    }, 30_000);
   });
 }
 
@@ -140,8 +158,9 @@ export async function initBot() {
       // Wait for server readiness
       let serverReady = false;
       let attempts = 0;
-      while (attempts < 15) {
+      while (attempts < 30) {
         if (await isLocalServerReady()) { serverReady = true; break; }
+        logger.info({ attempt: attempts + 1 }, "Waiting for local bot API server...");
         await new Promise(r => setTimeout(r, 1000));
         attempts++;
       }
@@ -151,7 +170,7 @@ export async function initBot() {
         usingLocalServer = true;
         logger.info({ port: LOCAL_BOT_API_PORT }, "Local bot API server ready — 2 GB file limit active");
       } else {
-        logger.warn("Local bot API server did not become ready in time — falling back to standard 20 MB limit");
+        logger.warn({ attempts }, "Local bot API server did not become ready in time — falling back to standard 20 MB limit");
       }
     } catch (err) {
       logger.warn({ err }, "Local bot API server failed to start — continuing with standard 20 MB limit");

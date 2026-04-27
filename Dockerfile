@@ -8,18 +8,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     openssl \
     libssl3 \
+    libatomic1 \
+    zlib1g \
     python3 \
     make \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN wget -qO /tmp/tg.zip \
-    "https://github.com/tdlib/telegram-bot-api/releases/download/v8.3/telegram-bot-api-amd64-linux.zip" \
-    && unzip -qo /tmp/tg.zip -d /usr/local/bin/ \
+# Install Telegram Bot API server binary for large file support (up to 2 GB)
+RUN set -e \
+    && wget -q "https://github.com/tdlib/telegram-bot-api/releases/download/v8.3/telegram-bot-api-amd64-linux.zip" \
+         -O /tmp/tg.zip \
+    && unzip -o /tmp/tg.zip -d /tmp/tg_bin/ \
+    && ls -la /tmp/tg_bin/ \
+    && find /tmp/tg_bin/ -name "telegram-bot-api" -exec cp {} /usr/local/bin/telegram-bot-api \; \
     && chmod +x /usr/local/bin/telegram-bot-api \
-    && rm /tmp/tg.zip \
-    && echo "telegram-bot-api installed: $(telegram-bot-api --version 2>&1 || true)" \
-    || echo "WARNING: telegram-bot-api download failed — large-file support disabled"
+    && rm -rf /tmp/tg.zip /tmp/tg_bin/ \
+    && echo "=== telegram-bot-api binary installed ===" \
+    && /usr/local/bin/telegram-bot-api --version 2>&1 || echo "NOTE: version check may fail but binary is installed" \
+    || (echo "ERROR: telegram-bot-api install failed — large file support will be disabled" && exit 0)
 
 RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
 
