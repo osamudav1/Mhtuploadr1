@@ -718,6 +718,40 @@ async function sendDocumentGroupDirect(chatId: number, filePaths: string[]): Pro
   }
 }
 
+// Direct sendMediaGroup (photos) — same fix as documents.
+// node-telegram-bot-api serialises ReadStreams incorrectly for sendMediaGroup.
+async function sendPhotoGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
+  const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
+  const url = `${baseApiUrl}/bot${token}/sendMediaGroup`;
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  const media = filePaths.map((_, i) => ({ type: "photo", media: `attach://${i}` }));
+  form.append("media", JSON.stringify(media));
+  filePaths.forEach((fp, i) => {
+    form.append(String(i), fs.createReadStream(fp), {
+      filename: path.basename(fp),
+      contentType: "image/jpeg",
+    });
+  });
+
+  try {
+    await axios.post(url, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 5 * 60_000,
+    });
+  } catch (err: any) {
+    const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
+    const status = err?.response?.status;
+    const wrapped: any = new Error(`ETELEGRAM: ${status ?? ""} ${desc}`.trim());
+    wrapped.code = "ETELEGRAM";
+    wrapped.response = err?.response;
+    throw wrapped;
+  }
+}
+
 async function sendImagesAsMediaGroups(
   chatId: number,
   images: Buffer[],
@@ -782,11 +816,7 @@ async function sendImagesAsMediaGroups(
       if (mode === "doc") {
         await callWithRetry(() => sendDocumentGroupDirect(targetChat(chatId), groupFiles), ct);
       } else {
-        const media = groupFiles.map((fp) => ({
-          type: "photo" as const,
-          media: fs.createReadStream(fp),
-        }));
-        await callWithRetry(() => bot.sendMediaGroup(targetChat(chatId), media), ct);
+        await callWithRetry(() => sendPhotoGroupDirect(targetChat(chatId), groupFiles), ct);
       }
 
       if (g < totalGroups - 1) {
