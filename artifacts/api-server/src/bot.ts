@@ -694,19 +694,14 @@ async function sendMediaGroupDirect(
   const url = `${baseApiUrl}/bot${token}/sendMediaGroup`;
   const isLocal = /localhost|127\.0\.0\.1/.test(baseApiUrl);
 
-  let body: string | FormData;
-  let headers: Record<string, string>;
+  // Log file existence so we can diagnose "Wrong file identifier" issues
+  const fileInfo = items.map(({ filePath }) => {
+    const exists = fs.existsSync(filePath);
+    return { filePath, exists, size: exists ? fs.statSync(filePath).size : -1 };
+  });
+  logger.info({ fileInfo, isLocal, url }, "sendMediaGroupDirect: pre-send check");
 
-  if (isLocal) {
-    // Local bot API server: pass file:// absolute paths — no multipart needed.
-    const media = items.map(({ filePath, type }) => ({
-      type,
-      media: `file://${filePath}`,
-    }));
-    body = JSON.stringify({ chat_id: chatId, media });
-    headers = { "Content-Type": "application/json" };
-  } else {
-    // Standard Telegram API: multipart with attach:// references.
+  const buildMultipart = () => {
     const form = new FormData();
     form.append("chat_id", String(chatId));
     const media = items.map(({ type }, i) => ({ type, media: `attach://f${i}` }));
@@ -717,24 +712,50 @@ async function sendMediaGroupDirect(
         contentType,
       });
     });
-    body = form;
-    headers = form.getHeaders();
-  }
+    return form;
+  };
 
-  try {
-    await axios.post(url, body, {
-      headers,
+  const post = async (b: string | FormData, h: Record<string, string>) => {
+    await axios.post(url, b, {
+      headers: h,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
       timeout: 5 * 60_000,
     });
-  } catch (err: any) {
+  };
+
+  const wrapErr = (err: any) => {
     const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
     const status = err?.response?.status;
     const wrapped: any = new Error(`ETELEGRAM: ${status ?? ""} ${desc}`.trim());
     wrapped.code = "ETELEGRAM";
     wrapped.response = err?.response;
-    throw wrapped;
+    return wrapped;
+  };
+
+  if (isLocal) {
+    // Local bot API server: try file:// absolute paths first (no upload overhead).
+    // Fall back to multipart if file:// is rejected (e.g. server version quirk).
+    const media = items.map(({ filePath, type }) => ({ type, media: `file://${filePath}` }));
+    try {
+      await post(JSON.stringify({ chat_id: chatId, media }), { "Content-Type": "application/json" });
+      return;
+    } catch (err: any) {
+      const desc: string = err?.response?.data?.description ?? err?.message ?? "";
+      logger.warn({ desc }, "file:// sendMediaGroup failed — retrying with multipart");
+      if (!desc.toLowerCase().includes("wrong file") && !desc.toLowerCase().includes("identifier")) {
+        throw wrapErr(err);
+      }
+      // Fall through to multipart
+    }
+  }
+
+  // Standard API (or file:// fallback): multipart upload
+  const form = buildMultipart();
+  try {
+    await post(form, form.getHeaders());
+  } catch (err: any) {
+    throw wrapErr(err);
   }
 }
 
