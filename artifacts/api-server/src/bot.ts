@@ -682,62 +682,48 @@ async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
 
 // ─── Media Groups ─────────────────────────────────────────────────────────────
 
-// Direct sendMediaGroup (documents) bypassing node-telegram-bot-api.
-// The library puts `media` in the URL query string, which the local Bot API
-// server cannot parse for sendMediaGroup — causing a "Wrong file identifier"
-// error. Building the multipart body manually with everything inside fixes it.
-async function sendDocumentGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
+// ─── Shared helper: post multipart OR file:// paths to sendMediaGroup ──────────
+// When the local Bot API server is active, files can be referenced by their
+// absolute path ("file:///tmp/...") — no multipart upload required.
+// When talking to the standard Telegram API, we must upload via attach://.
+async function sendMediaGroupDirect(
+  chatId: number,
+  items: Array<{ filePath: string; type: "document" | "photo"; contentType: string }>,
+): Promise<void> {
   const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
   const url = `${baseApiUrl}/bot${token}/sendMediaGroup`;
+  const isLocal = /localhost|127\.0\.0\.1/.test(baseApiUrl);
 
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  const media = filePaths.map((_, i) => ({ type: "document", media: `attach://${i}` }));
-  form.append("media", JSON.stringify(media));
-  filePaths.forEach((fp, i) => {
-    form.append(String(i), fs.createReadStream(fp), {
-      filename: path.basename(fp),
-      contentType: "application/octet-stream",
-    });
-  });
+  let body: string | FormData;
+  let headers: Record<string, string>;
 
-  try {
-    await axios.post(url, form, {
-      headers: form.getHeaders(),
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      timeout: 5 * 60_000, // 5 minutes — large document groups can be slow
+  if (isLocal) {
+    // Local bot API server: pass file:// absolute paths — no multipart needed.
+    const media = items.map(({ filePath, type }) => ({
+      type,
+      media: `file://${filePath}`,
+    }));
+    body = JSON.stringify({ chat_id: chatId, media });
+    headers = { "Content-Type": "application/json" };
+  } else {
+    // Standard Telegram API: multipart with attach:// references.
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    const media = items.map(({ type }, i) => ({ type, media: `attach://f${i}` }));
+    form.append("media", JSON.stringify(media));
+    items.forEach(({ filePath, contentType }, i) => {
+      form.append(`f${i}`, fs.createReadStream(filePath), {
+        filename: path.basename(filePath),
+        contentType,
+      });
     });
-  } catch (err: any) {
-    const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
-    const status = err?.response?.status;
-    const wrapped: any = new Error(`ETELEGRAM: ${status ?? ""} ${desc}`.trim());
-    wrapped.code = "ETELEGRAM";
-    wrapped.response = err?.response;
-    throw wrapped;
+    body = form;
+    headers = form.getHeaders();
   }
-}
-
-// Direct sendMediaGroup (photos) — same fix as documents.
-// node-telegram-bot-api serialises ReadStreams incorrectly for sendMediaGroup.
-async function sendPhotoGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
-  const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
-  const url = `${baseApiUrl}/bot${token}/sendMediaGroup`;
-
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  const media = filePaths.map((_, i) => ({ type: "photo", media: `attach://${i}` }));
-  form.append("media", JSON.stringify(media));
-  filePaths.forEach((fp, i) => {
-    form.append(String(i), fs.createReadStream(fp), {
-      filename: path.basename(fp),
-      contentType: "image/jpeg",
-    });
-  });
 
   try {
-    await axios.post(url, form, {
-      headers: form.getHeaders(),
+    await axios.post(url, body, {
+      headers,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
       timeout: 5 * 60_000,
@@ -750,6 +736,20 @@ async function sendPhotoGroupDirect(chatId: number, filePaths: string[]): Promis
     wrapped.response = err?.response;
     throw wrapped;
   }
+}
+
+function sendDocumentGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
+  return sendMediaGroupDirect(
+    chatId,
+    filePaths.map((fp) => ({ filePath: fp, type: "document", contentType: "application/octet-stream" })),
+  );
+}
+
+function sendPhotoGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
+  return sendMediaGroupDirect(
+    chatId,
+    filePaths.map((fp) => ({ filePath: fp, type: "photo", contentType: "image/jpeg" })),
+  );
 }
 
 async function sendImagesAsMediaGroups(
