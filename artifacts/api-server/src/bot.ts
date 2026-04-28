@@ -692,70 +692,35 @@ async function sendMediaGroupDirect(
 ): Promise<void> {
   const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
   const url = `${baseApiUrl}/bot${token}/sendMediaGroup`;
-  const isLocal = /localhost|127\.0\.0\.1/.test(baseApiUrl);
 
-  // Log file existence so we can diagnose "Wrong file identifier" issues
-  const fileInfo = items.map(({ filePath }) => {
-    const exists = fs.existsSync(filePath);
-    return { filePath, exists, size: exists ? fs.statSync(filePath).size : -1 };
-  });
-  logger.info({ fileInfo, isLocal, url }, "sendMediaGroupDirect: pre-send check");
-
-  const buildMultipart = () => {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    const media = items.map(({ type }, i) => ({ type, media: `attach://f${i}` }));
-    form.append("media", JSON.stringify(media));
-    items.forEach(({ filePath, contentType }, i) => {
-      form.append(`f${i}`, fs.createReadStream(filePath), {
-        filename: path.basename(filePath),
-        contentType,
-      });
+  // Always use multipart upload — works for both local Bot API server and
+  // standard Telegram API. The file:// approach breaks on filenames with
+  // spaces or special characters (brackets, dashes) due to URL parsing in TDLib.
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  const media = items.map(({ type }, i) => ({ type, media: `attach://f${i}` }));
+  form.append("media", JSON.stringify(media));
+  items.forEach(({ filePath, contentType }, i) => {
+    form.append(`f${i}`, fs.createReadStream(filePath), {
+      filename: path.basename(filePath),
+      contentType,
     });
-    return form;
-  };
+  });
 
-  const post = async (b: string | FormData, h: Record<string, string>) => {
-    await axios.post(url, b, {
-      headers: h,
+  try {
+    await axios.post(url, form, {
+      headers: form.getHeaders(),
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
       timeout: 5 * 60_000,
     });
-  };
-
-  const wrapErr = (err: any) => {
+  } catch (err: any) {
     const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
     const status = err?.response?.status;
     const wrapped: any = new Error(`ETELEGRAM: ${status ?? ""} ${desc}`.trim());
     wrapped.code = "ETELEGRAM";
     wrapped.response = err?.response;
-    return wrapped;
-  };
-
-  if (isLocal) {
-    // Local bot API server: try file:// absolute paths first (no upload overhead).
-    // Fall back to multipart if file:// is rejected (e.g. server version quirk).
-    const media = items.map(({ filePath, type }) => ({ type, media: `file://${filePath}` }));
-    try {
-      await post(JSON.stringify({ chat_id: chatId, media }), { "Content-Type": "application/json" });
-      return;
-    } catch (err: any) {
-      const desc: string = err?.response?.data?.description ?? err?.message ?? "";
-      logger.warn({ desc }, "file:// sendMediaGroup failed — retrying with multipart");
-      if (!desc.toLowerCase().includes("wrong file") && !desc.toLowerCase().includes("identifier")) {
-        throw wrapErr(err);
-      }
-      // Fall through to multipart
-    }
-  }
-
-  // Standard API (or file:// fallback): multipart upload
-  const form = buildMultipart();
-  try {
-    await post(form, form.getHeaders());
-  } catch (err: any) {
-    throw wrapErr(err);
+    throw wrapped;
   }
 }
 
@@ -797,16 +762,25 @@ async function sendImagesAsMediaGroups(
   try {
     if (mode === "doc") {
       // DOCUMENTS — Telegram does NOT recompress, text stays razor-sharp.
+      // The local Bot API server (TDLib) rejects WebP and some other formats
+      // when uploaded via multipart. Convert everything to JPEG at maximum
+      // quality so the image is accepted and text remains crisp.
       for (let i = 0; i < images.length; i++) {
         ct.throwIfCancelled();
         const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
-        const ext = (meta.format === "png" ? "png"
-                  : meta.format === "webp" ? "webp"
-                  : meta.format === "gif"  ? "gif"
-                  : "jpg");
-        const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].${ext}`;
+        let imgBuf: Buffer;
+        if (meta.format === "jpeg" || meta.format === "jpg") {
+          // Already JPEG — use as-is; no re-encode quality loss.
+          imgBuf = images[i];
+        } else {
+          // WebP / PNG / GIF / other → convert to high-quality JPEG.
+          imgBuf = await sharp(images[i])
+            .jpeg({ quality: 95, mozjpeg: true, chromaSubsampling: "4:4:4", trellisQuantisation: true })
+            .toBuffer();
+        }
+        const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
         const tmpPath = path.join(tempDir, fileName);
-        fs.writeFileSync(tmpPath, images[i]);
+        fs.writeFileSync(tmpPath, imgBuf);
         tempFiles.push(tmpPath);
       }
     } else {
