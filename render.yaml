@@ -8,6 +8,8 @@ services:
     region: singapore
     healthCheckPath: /
     envVars:
+      - key: OWNER_IDS
+        value: "6762363593,8646459264"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_API_ID

@@ -195,7 +195,9 @@ export async function initBot() {
   logger.info("Telegram bot started with polling");
 }
 
-const OWNER_ID = 6762363593;
+const OWNER_IDS = process.env["OWNER_IDS"] 
+  ? process.env["OWNER_IDS"].split(",").map(id => parseInt(id.trim())).filter(id => !isNaN(id))
+  : [6762363593, 8646459264];
 
 // ─── Storage channel routing ──────────────────────────────────────────────────
 // If STORAGE_CHANNEL_ID is set, all media (images & PDFs) are sent to that channel
@@ -233,7 +235,8 @@ function targetChat(dmChatId: number): number | string {
   return channelActive() ? STORAGE_CHANNEL_ID! : dmChatId;
 }
 function isOwner(userId: number | undefined): boolean {
-  return userId === OWNER_ID;
+  if (!userId) return false;
+  return OWNER_IDS.includes(userId);
 }
 
 // ─── Cancellation ─────────────────────────────────────────────────────────────
