@@ -203,12 +203,12 @@ const OWNER_IDS = process.env["OWNER_IDS"]
 // If STORAGE_CHANNEL_ID is set, all media (images & PDFs) are sent to that channel
 // instead of the owner's DM. Status messages always stay in DM.
 // Bot must be added to the channel as an admin with "Post messages" permission.
-const STORAGE_CHANNEL_ID_RAW = process.env["STORAGE_CHANNEL_ID"]?.trim();
-const STORAGE_CHANNEL_ID: number | string | null = STORAGE_CHANNEL_ID_RAW
-  ? (/^-?\d+$/.test(STORAGE_CHANNEL_ID_RAW) ? Number(STORAGE_CHANNEL_ID_RAW) : STORAGE_CHANNEL_ID_RAW)
+const STORAGE_CHANNEL_ID_RAW_ENV = process.env["STORAGE_CHANNEL_ID"]?.trim();
+let STORAGE_CHANNEL_ID: number | string | null = STORAGE_CHANNEL_ID_RAW_ENV
+  ? (/^-?\d+$/.test(STORAGE_CHANNEL_ID_RAW_ENV) ? Number(STORAGE_CHANNEL_ID_RAW_ENV) : STORAGE_CHANNEL_ID_RAW_ENV)
   : null;
 
-// ── Persistent toggle: channel ON/OFF ─────────────────────────────────────────
+// ── Persistent toggle: channel ON/OFF & ID ────────────────────────────────────
 const STATE_FILE = path.join(process.cwd(), "bot-state.json");
 let channelEnabled = true; // default ON if STORAGE_CHANNEL_ID is set
 
@@ -217,12 +217,13 @@ function loadChannelState() {
     if (fs.existsSync(STATE_FILE)) {
       const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
       if (typeof raw?.channelEnabled === "boolean") channelEnabled = raw.channelEnabled;
+      if (raw?.storageChannelId !== undefined) STORAGE_CHANNEL_ID = raw.storageChannelId;
     }
   } catch { /* ignore */ }
 }
 function saveChannelState() {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ channelEnabled }));
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ channelEnabled, storageChannelId: STORAGE_CHANNEL_ID }));
   } catch { /* ignore */ }
 }
 loadChannelState();
@@ -1066,6 +1067,23 @@ function channelKeyboard() {
 bot.onText(/\/channel/, (msg) => {
   if (!isOwner(msg.from?.id)) return;
   bot.sendMessage(msg.chat.id, channelStatusText(), channelKeyboard());
+});
+
+bot.onText(/\/setchannel\s+(.+)/, async (msg, match) => {
+  if (!isOwner(msg.from?.id)) return;
+  const chatId = msg.chat.id;
+  const rawId = match?.[1]?.trim();
+  if (!rawId) return;
+
+  const newId = /^-?\d+$/.test(rawId) ? Number(rawId) : rawId;
+  STORAGE_CHANNEL_ID = newId;
+  saveChannelState();
+
+  await bot.sendMessage(
+    chatId,
+    `✅ Storage Channel ကို သတ်မှတ်ပြီးပါပြီ!\n\nID: \`${newId}\`\n\nယခုမှစ၍ /channel command ဖြင့် ON/OFF ပြုလုပ်နိုင်ပါပြီ။`,
+    { parse_mode: "Markdown" }
+  );
 });
 
 // ─── Document Handler ────────────────────────────────────────────────────────
