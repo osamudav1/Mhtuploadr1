@@ -812,10 +812,29 @@ async function sendImagesAsMediaGroups(
         { chat_id: chatId, message_id: statusMsgId }
       ).catch(() => { /* edit errors are harmless */ });
 
-      if (mode === "doc") {
-        await callWithRetry(() => sendDocumentGroupDirect(targetChat(chatId), groupFiles), ct);
-      } else {
-        await callWithRetry(() => sendPhotoGroupDirect(targetChat(chatId), groupFiles), ct);
+      const target = targetChat(chatId);
+      try {
+        if (mode === "doc") {
+          await callWithRetry(() => sendDocumentGroupDirect(target, groupFiles), ct);
+        } else {
+          await callWithRetry(() => sendPhotoGroupDirect(target, groupFiles), ct);
+        }
+      } catch (err: any) {
+        // If sending to channel fails with "chat not found", fallback to DM and notify
+        const desc = err?.response?.body?.description || err?.message || "";
+        if (target !== chatId && (desc.includes("chat not found") || desc.includes("bot was blocked"))) {
+          logger.warn({ target, err: desc }, "Channel send failed, falling back to DM");
+          await bot.sendMessage(chatId, `⚠️ Channel သို့ ပို့၍မရပါ (${desc})။ DM သို့သာ ပြောင်းပို့ပေးပါမည်။`);
+          
+          // Retry sending to DM
+          if (mode === "doc") {
+            await callWithRetry(() => sendDocumentGroupDirect(chatId, groupFiles), ct);
+          } else {
+            await callWithRetry(() => sendPhotoGroupDirect(chatId, groupFiles), ct);
+          }
+        } else {
+          throw err;
+        }
       }
 
       if (g < totalGroups - 1) {
@@ -1084,14 +1103,26 @@ bot.onText(/\/setchannel\s+(.+)/, async (msg, match) => {
   if (!rawId) return;
 
   const newId = /^-?\d+$/.test(rawId) ? Number(rawId) : rawId;
-  STORAGE_CHANNEL_ID = newId;
-  saveChannelState();
 
-  await bot.sendMessage(
-    chatId,
-    `✅ Storage Channel ကို သတ်မှတ်ပြီးပါပြီ!\n\nID: \`${newId}\`\n\nယခုမှစ၍ /channel command ဖြင့် ON/OFF ပြုလုပ်နိုင်ပါပြီ။`,
-    { parse_mode: "Markdown" }
-  );
+  try {
+    const statusMsg = await bot.sendMessage(chatId, `⏳ Channel ID \`${newId}\` ကို စစ်ဆေးနေသည်...`, { parse_mode: "Markdown" });
+    const chat = await bot.getChat(newId);
+    
+    STORAGE_CHANNEL_ID = newId;
+    saveChannelState();
+
+    await bot.editMessageText(
+      `✅ Storage Channel ကို သတ်မှတ်ပြီးပါပြီ!\n\n**Channel**: ${chat.title || "Unknown"}\n**ID**: \`${newId}\`\n\nယခုမှစ၍ /channel command ဖြင့် ON/OFF ပြုလုပ်နိုင်ပါပြီ။`,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+    );
+  } catch (err: any) {
+    const desc = err?.response?.body?.description || err?.message || "Unknown error";
+    await bot.sendMessage(
+      chatId,
+      `❌ Channel ID မှားယွင်းနေပါသည် သို့မဟုတ် Bot သည် ထို Channel တွင် Admin မဟုတ်ပါ။\n\n**Error**: \`${desc}\`\n\nကျေးဇူးပြု၍ ID မှန်ကန်ကြောင်းနှင့် Bot ကို Admin ခန့်ထားကြောင်း စစ်ဆေးပါ။`,
+      { parse_mode: "Markdown" }
+    );
+  }
 });
 
 // ─── Document Handler ────────────────────────────────────────────────────────
