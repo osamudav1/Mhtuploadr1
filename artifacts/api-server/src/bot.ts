@@ -1066,11 +1066,19 @@ function channelKeyboard() {
 
 bot.onText(/\/channel/, (msg) => {
   if (!isOwner(msg.from?.id)) return;
+  if (msg.chat.type !== "private") {
+    bot.sendMessage(msg.chat.id, "⚠️ ဤ command ကို Bot ၏ DM တွင်သာ အသုံးပြုနိုင်ပါသည်။");
+    return;
+  }
   bot.sendMessage(msg.chat.id, channelStatusText(), channelKeyboard());
 });
 
 bot.onText(/\/setchannel\s+(.+)/, async (msg, match) => {
   if (!isOwner(msg.from?.id)) return;
+  if (msg.chat.type !== "private") {
+    bot.sendMessage(msg.chat.id, "⚠️ ဤ command ကို Bot ၏ DM တွင်သာ အသုံးပြုနိုင်ပါသည်။");
+    return;
+  }
   const chatId = msg.chat.id;
   const rawId = match?.[1]?.trim();
   if (!rawId) return;
@@ -1215,6 +1223,10 @@ bot.on("callback_query", async (query) => {
 
   // ── Channel ON/OFF toggle (independent of pending files) ────────────────────
   if (action === "channel_toggle") {
+    if (query.message?.chat.type !== "private") {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ ဤလုပ်ဆောင်ချက်ကို DM တွင်သာ ပြုလုပ်နိုင်ပါသည်။", show_alert: true });
+      return;
+    }
     if (STORAGE_CHANNEL_ID === null) {
       await bot.editMessageText(channelStatusText(), {
         chat_id: chatId, message_id: messageId,
