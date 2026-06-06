@@ -202,7 +202,7 @@ const OWNER_IDS = process.env["OWNER_IDS"]
 // ─── Storage channel routing ──────────────────────────────────────────────────
 // If STORAGE_CHANNEL_ID is set, all media (images & PDFs) are sent to that channel
 // instead of the owner's DM. Status messages always stay in DM.
-// Bot must be added to the channel as an admin with "Post messages" permission.
+// Bot must be added to the channel/group as an admin with "Post messages" permission.
 const STORAGE_CHANNEL_ID_RAW_ENV = process.env["STORAGE_CHANNEL_ID"]?.trim();
 let STORAGE_CHANNEL_ID: number | string | null = STORAGE_CHANNEL_ID_RAW_ENV
   ? (/^-?\d+$/.test(STORAGE_CHANNEL_ID_RAW_ENV) ? Number(STORAGE_CHANNEL_ID_RAW_ENV) : STORAGE_CHANNEL_ID_RAW_ENV)
@@ -227,6 +227,22 @@ function saveChannelState() {
   } catch { /* ignore */ }
 }
 loadChannelState();
+
+// ── Supergroup migration helper ───────────────────────────────────────────────
+// When a group is upgraded to a supergroup, Telegram returns 400 with
+// parameters.migrate_to_chat_id containing the new supergroup ID.
+function extractMigrateToChatId(err: any): number | null {
+  const id =
+    err?.response?.body?.parameters?.migrate_to_chat_id ??
+    err?.response?.data?.parameters?.migrate_to_chat_id ??
+    null;
+  return typeof id === "number" ? id : null;
+}
+
+function isSuperGroupMigration(err: any): boolean {
+  const desc: string = err?.response?.body?.description ?? err?.message ?? "";
+  return desc.includes("upgraded to a supergroup");
+}
 
 function channelActive(): boolean {
   return STORAGE_CHANNEL_ID !== null && channelEnabled;
@@ -812,21 +828,43 @@ async function sendImagesAsMediaGroups(
         { chat_id: chatId, message_id: statusMsgId }
       ).catch(() => { /* edit errors are harmless */ });
 
-      const target = targetChat(chatId);
+      let target = targetChat(chatId);
       try {
         if (mode === "doc") {
-          await callWithRetry(() => sendDocumentGroupDirect(target, groupFiles), ct);
+          await callWithRetry(() => sendDocumentGroupDirect(target as number, groupFiles), ct);
         } else {
-          await callWithRetry(() => sendPhotoGroupDirect(target, groupFiles), ct);
+          await callWithRetry(() => sendPhotoGroupDirect(target as number, groupFiles), ct);
         }
       } catch (err: any) {
-        // If sending to channel fails with "chat not found", fallback to DM and notify
-        const desc = err?.response?.body?.description || err?.message || "";
-        if (target !== chatId && (desc.includes("chat not found") || desc.includes("bot was blocked"))) {
-          logger.warn({ target, err: desc }, "Channel send failed, falling back to DM");
-          await bot.sendMessage(chatId, `⚠️ Channel သို့ ပို့၍မရပါ (${desc})။ DM သို့သာ ပြောင်းပို့ပေးပါမည်။`);
-          
-          // Retry sending to DM
+        const desc: string = err?.response?.body?.description || err?.message || "";
+
+        // ── Supergroup migration: group was upgraded, auto-update stored ID ──────
+        if (target !== chatId && isSuperGroupMigration(err)) {
+          const newId = extractMigrateToChatId(err);
+          if (newId) {
+            logger.info({ oldId: target, newId }, "Group upgraded to supergroup — updating stored ID");
+            STORAGE_CHANNEL_ID = newId;
+            saveChannelState();
+            target = newId;
+            await bot.sendMessage(
+              chatId,
+              `⚠️ Group သည် Supergroup ဖြစ်သွားသောကြောင့် ID အလိုအလျောက် ပြောင်းလိုက်ပြီ!\n` +
+              `📌 New ID: \`${newId}\`\n\nဆက်လက် ပို့နေပါသည်...`,
+              { parse_mode: "Markdown" }
+            ).catch(() => {});
+            // Retry with new supergroup ID
+            if (mode === "doc") {
+              await callWithRetry(() => sendDocumentGroupDirect(newId, groupFiles), ct);
+            } else {
+              await callWithRetry(() => sendPhotoGroupDirect(newId, groupFiles), ct);
+            }
+          } else {
+            throw err;
+          }
+        // ── Chat not found / bot blocked: fallback to DM ─────────────────────────
+        } else if (target !== chatId && (desc.includes("chat not found") || desc.includes("bot was blocked") || desc.includes("CHAT_WRITE_FORBIDDEN") || desc.includes("not enough rights"))) {
+          logger.warn({ target, err: desc }, "Channel/group send failed, falling back to DM");
+          await bot.sendMessage(chatId, `⚠️ Channel/Group သို့ ပို့၍မရပါ (${desc})။\nDM သို့သာ ပြောင်းပို့ပေးပါမည်။`);
           if (mode === "doc") {
             await callWithRetry(() => sendDocumentGroupDirect(chatId, groupFiles), ct);
           } else {
@@ -886,14 +924,51 @@ async function finalizePdf(
       bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: statusMsgId }), ct
     ).catch(() => {});
 
-    await callWithRetry(() =>
-      bot.sendDocument(
-        targetChat(chatId),
-        pdfPath!,
-        {},
-        { filename: `${baseName}.pdf`, contentType: "application/pdf" }
-      ), ct
-    );
+    let pdfTarget = targetChat(chatId);
+    try {
+      await callWithRetry(() =>
+        bot.sendDocument(
+          pdfTarget,
+          pdfPath!,
+          {},
+          { filename: `${baseName}.pdf`, contentType: "application/pdf" }
+        ), ct
+      );
+    } catch (sendErr: any) {
+      // Supergroup migration: auto-update ID and retry
+      if (pdfTarget !== chatId && isSuperGroupMigration(sendErr)) {
+        const newId = extractMigrateToChatId(sendErr);
+        if (newId) {
+          logger.info({ oldId: pdfTarget, newId }, "PDF: group upgraded to supergroup — updating stored ID");
+          STORAGE_CHANNEL_ID = newId;
+          saveChannelState();
+          pdfTarget = newId;
+          await bot.sendMessage(
+            chatId,
+            `⚠️ Group သည် Supergroup ဖြစ်သွားသောကြောင့် ID အလိုအလျောက် ပြောင်းလိုက်ပြီ!\n📌 New ID: \`${newId}\``,
+            { parse_mode: "Markdown" }
+          ).catch(() => {});
+          await callWithRetry(() =>
+            bot.sendDocument(pdfTarget, pdfPath!, {}, { filename: `${baseName}.pdf`, contentType: "application/pdf" }), ct
+          );
+        } else {
+          throw sendErr;
+        }
+      // Chat not found / no rights: fallback to DM
+      } else if (pdfTarget !== chatId) {
+        const desc = sendErr?.response?.body?.description || sendErr?.message || "";
+        if (desc.includes("chat not found") || desc.includes("bot was blocked") || desc.includes("not enough rights") || desc.includes("CHAT_WRITE_FORBIDDEN")) {
+          await bot.sendMessage(chatId, `⚠️ Channel/Group သို့ PDF ပို့၍မရပါ (${desc})။\nDM သို့သာ ပြောင်းပို့ပေးပါမည်။`);
+          await callWithRetry(() =>
+            bot.sendDocument(chatId, pdfPath!, {}, { filename: `${baseName}.pdf`, contentType: "application/pdf" }), ct
+          );
+        } else {
+          throw sendErr;
+        }
+      } else {
+        throw sendErr;
+      }
+    }
 
     await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
     logger.info({ chatId, fileName, kept: finalImages.length, removed: removedCount }, "PDF sent");
@@ -1005,8 +1080,12 @@ bot.onText(/\/start/, (msg) => {
       `📄 .pdf ဖိုင် → ပုံများ တိုက်ရိုက် (10 ပုံစီ) ပို့ပေးသည်\n` +
       `🗂 .mht / .mhtml ဖိုင် → PDF သို့မဟုတ် ပုံများ ရွေးချယ်နိုင်သည်\n\n` +
       `ဖိုင်ကို Document အဖြစ် (ဖိုင်တိုက်ရိုက်) ပို့ပါ။\n\n` +
-      `/channel — Storage channel ON/OFF ပြောင်းရန်\n` +
-      `/status — Local server / file limit အခြေအနေ ကြည့်ရန်\n` +
+      `【 Channel / Group စီမံခန့်ခွဲမှု 】\n` +
+      `/channel — Channel/Group အခြေအနေ ကြည့်ရန် / ON·OFF ပြောင်းရန်\n` +
+      `/setchannel <ID> — Channel သို့မဟုတ် Group ID သတ်မှတ်ရန်\n` +
+      `/delchannel — Channel/Group ဖျက်ပြီး DM သို့ ပြန်ပို့ရန်\n\n` +
+      `【 အခြား 】\n` +
+      `/status — Bot / file limit အခြေအနေ ကြည့်ရန်\n` +
       `/cancel — လုပ်ဆောင်နေသော task ကို ဖျက်ရန်`
   );
 });
@@ -1063,22 +1142,33 @@ bot.onText(/\/status/, async (msg) => {
   );
 });
 
-// ─── /channel — toggle storage channel ON/OFF ────────────────────────────────
+// ─── /channel — toggle storage channel/group ON/OFF ──────────────────────────
 function channelStatusText(): string {
   if (STORAGE_CHANNEL_ID === null) {
-    return `📡 Storage Channel: ⚙️ မသတ်မှတ်ထားပါ\n\nSTORAGE_CHANNEL_ID env var ကို သတ်မှတ်ပြီးမှ ON/OFF လုပ်နိုင်ပါမည်။\nယခု ပုံများကို DM သို့သာ ပို့ပါသည်။`;
+    return (
+      `📡 Storage Channel/Group: ⚙️ မသတ်မှတ်ထားပါ\n\n` +
+      `Channel သို့မဟုတ် Group ID သတ်မှတ်ရန်:\n` +
+      `/setchannel <ID>\n\n` +
+      `ဥပမာ:\n` +
+      `• Channel: \`/setchannel -1001234567890\`\n` +
+      `• Group:   \`/setchannel -1009876543210\`\n\n` +
+      `ယခု ပုံများကို DM သို့သာ ပို့ပါသည်။`
+    );
   }
-  const dest = channelEnabled ? `📡 Channel (${STORAGE_CHANNEL_ID})` : `💬 DM`;
+  const dest = channelEnabled ? `📡 Channel/Group (\`${STORAGE_CHANNEL_ID}\`)` : `💬 DM (Owner)`;
   const state = channelEnabled ? "🟢 ON" : "🔴 OFF";
-  return `Storage Channel: ${state}\n\nပုံများ ပို့မည့်နေရာ: ${dest}`;
+  return `📡 Storage Destination: ${state}\n\nပုံများ ပို့မည့်နေရာ: ${dest}\n\nID ပြောင်းရန်: /setchannel <ID>\nဖျက်ရန် (DM ပြန်): /delchannel`;
 }
 
 function channelKeyboard() {
   if (STORAGE_CHANNEL_ID === null) return undefined;
-  const label = channelEnabled ? "🔴 Channel ပိတ်ရန် (OFF)" : "🟢 Channel ဖွင့်ရန် (ON)";
+  const toggleLabel = channelEnabled ? "🔴 OFF (DM ပြောင်းရန်)" : "🟢 ON (Channel/Group ပြန်ဖွင့်)";
   return {
     reply_markup: {
-      inline_keyboard: [[{ text: label, callback_data: "channel_toggle" }]],
+      inline_keyboard: [
+        [{ text: toggleLabel, callback_data: "channel_toggle" }],
+        [{ text: "🗑 Channel/Group ဖျက်ပြီး DM သို့ပြောင်း", callback_data: "channel_delete" }],
+      ],
     },
   };
 }
@@ -1089,7 +1179,25 @@ bot.onText(/\/channel/, (msg) => {
     bot.sendMessage(msg.chat.id, "⚠️ ဤ command ကို Bot ၏ DM တွင်သာ အသုံးပြုနိုင်ပါသည်။");
     return;
   }
-  bot.sendMessage(msg.chat.id, channelStatusText(), channelKeyboard());
+  bot.sendMessage(msg.chat.id, channelStatusText(), { ...channelKeyboard(), parse_mode: "Markdown" });
+});
+
+bot.onText(/\/delchannel/, async (msg) => {
+  if (!isOwner(msg.from?.id)) return;
+  if (msg.chat.type !== "private") {
+    bot.sendMessage(msg.chat.id, "⚠️ ဤ command ကို Bot ၏ DM တွင်သာ အသုံးပြုနိုင်ပါသည်။");
+    return;
+  }
+  const chatId = msg.chat.id;
+  if (STORAGE_CHANNEL_ID === null) {
+    bot.sendMessage(chatId, "⚠️ Storage Channel/Group မသတ်မှတ်ထားပါ — ဖျက်စရာ မရှိပါ။");
+    return;
+  }
+  const oldId = STORAGE_CHANNEL_ID;
+  STORAGE_CHANNEL_ID = null;
+  channelEnabled = true;
+  saveChannelState();
+  bot.sendMessage(chatId, `✅ Channel/Group (\`${oldId}\`) ဖျက်ပြီးပါပြီ။\nယခုမှစ၍ ပုံများကို DM (Owner) သို့ ပို့ပါမည်။`, { parse_mode: "Markdown" });
 });
 
 bot.onText(/\/setchannel\s+(.+)/, async (msg, match) => {
@@ -1105,21 +1213,25 @@ bot.onText(/\/setchannel\s+(.+)/, async (msg, match) => {
   const newId = /^-?\d+$/.test(rawId) ? Number(rawId) : rawId;
 
   try {
-    const statusMsg = await bot.sendMessage(chatId, `⏳ Channel ID \`${newId}\` ကို စစ်ဆေးနေသည်...`, { parse_mode: "Markdown" });
+    const statusMsg = await bot.sendMessage(chatId, `⏳ ID \`${newId}\` ကို စစ်ဆေးနေသည်...`, { parse_mode: "Markdown" });
     const chat = await bot.getChat(newId);
+    const chatType = chat.type; // "channel", "group", "supergroup", "private"
+    const typeLabel = chatType === "channel" ? "📡 Channel" : chatType === "supergroup" ? "👥 Supergroup" : chatType === "group" ? "👥 Group" : "Chat";
     
     STORAGE_CHANNEL_ID = newId;
+    channelEnabled = true;
     saveChannelState();
 
     await bot.editMessageText(
-      `✅ Storage Channel ကို သတ်မှတ်ပြီးပါပြီ!\n\n**Channel**: ${chat.title || "Unknown"}\n**ID**: \`${newId}\`\n\nယခုမှစ၍ /channel command ဖြင့် ON/OFF ပြုလုပ်နိုင်ပါပြီ။`,
+      `✅ Storage Destination သတ်မှတ်ပြီးပါပြီ!\n\n${typeLabel}: *${chat.title || "Unknown"}*\nID: \`${newId}\`\n\nယခုမှစ၍ ပုံ/PDF များကို ထို ${typeLabel} သို့ ပို့ပါမည်။\n\n/channel — ON/OFF ပြောင်းရန်`,
       { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
     );
   } catch (err: any) {
     const desc = err?.response?.body?.description || err?.message || "Unknown error";
     await bot.sendMessage(
       chatId,
-      `❌ Channel ID မှားယွင်းနေပါသည် သို့မဟုတ် Bot သည် ထို Channel တွင် Admin မဟုတ်ပါ။\n\n**Error**: \`${desc}\`\n\nကျေးဇူးပြု၍ ID မှန်ကန်ကြောင်းနှင့် Bot ကို Admin ခန့်ထားကြောင်း စစ်ဆေးပါ။`,
+      `❌ ID မှားယွင်းနေပါသည် သို့မဟုတ် Bot သည် ထို Chat တွင် Admin မဟုတ်ပါ။\n\n*Error*: \`${desc}\`\n\n` +
+      `စစ်ဆေးပါ:\n• Bot ကို Channel/Group တွင် Admin ခန့်ထားပါ\n• ID မှန်ကန်ကြောင်း စစ်ဆေးပါ\n• Group ဆိုလျှင် Bot ကို group member အဖြစ် ထည့်ပြီး Admin ခန့်ပါ`,
       { parse_mode: "Markdown" }
     );
   }
@@ -1260,16 +1372,33 @@ bot.on("callback_query", async (query) => {
     }
     if (STORAGE_CHANNEL_ID === null) {
       await bot.editMessageText(channelStatusText(), {
-        chat_id: chatId, message_id: messageId,
+        chat_id: chatId, message_id: messageId, parse_mode: "Markdown",
       }).catch(() => {});
       return;
     }
     channelEnabled = !channelEnabled;
     saveChannelState();
     await bot.editMessageText(channelStatusText(), {
-      chat_id: chatId, message_id: messageId,
+      chat_id: chatId, message_id: messageId, parse_mode: "Markdown",
       ...channelKeyboard(),
     }).catch(() => {});
+    return;
+  }
+
+  // ── Channel/Group delete ──────────────────────────────────────────────────────
+  if (action === "channel_delete") {
+    if (query.message?.chat.type !== "private") {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ DM တွင်သာ ပြုလုပ်နိုင်ပါသည်။", show_alert: true });
+      return;
+    }
+    const oldId = STORAGE_CHANNEL_ID;
+    STORAGE_CHANNEL_ID = null;
+    channelEnabled = true;
+    saveChannelState();
+    await bot.editMessageText(
+      `✅ Channel/Group (\`${oldId}\`) ဖျက်ပြီးပါပြီ။\nယခုမှစ၍ ပုံများကို DM (Owner) သို့ ပို့ပါမည်။\n\nChannel/Group သစ် ထည့်ရန်: /setchannel <ID>`,
+      { chat_id: chatId, message_id: messageId, parse_mode: "Markdown" }
+    ).catch(() => {});
     return;
   }
 
