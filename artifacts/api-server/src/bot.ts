@@ -827,18 +827,41 @@ async function sendMediaGroupDirect(
   }
 }
 
-function sendDocumentGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
-  return sendMediaGroupDirect(
-    chatId,
-    filePaths.map((fp) => ({ filePath: fp, type: "document", contentType: "application/octet-stream" })),
-  );
-}
+// ─── Send a single file to Telegram (document or photo) ──────────────────────
+async function sendSingleFileDirect(
+  chatId: number,
+  filePath: string,
+  mode: "doc" | "photo",
+  fileName?: string,
+): Promise<void> {
+  const baseApiUrl = (bot as any).options.baseApiUrl ?? "https://api.telegram.org";
+  const endpoint = mode === "doc" ? "sendDocument" : "sendPhoto";
+  const url = `${baseApiUrl}/bot${token}/${endpoint}`;
+  const fieldName = mode === "doc" ? "document" : "photo";
+  const contentType = mode === "doc" ? "application/octet-stream" : "image/jpeg";
 
-function sendPhotoGroupDirect(chatId: number, filePaths: string[]): Promise<void> {
-  return sendMediaGroupDirect(
-    chatId,
-    filePaths.map((fp) => ({ filePath: fp, type: "photo", contentType: "image/jpeg" })),
-  );
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append(fieldName, fs.createReadStream(filePath), {
+    filename: fileName ?? path.basename(filePath),
+    contentType,
+  });
+
+  try {
+    await axios.post(url, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 5 * 60_000,
+    });
+  } catch (err: any) {
+    const desc = err?.response?.data?.description ?? err?.message ?? "unknown";
+    const status = err?.response?.status;
+    const wrapped: any = new Error(`ETELEGRAM: ${status ?? ""} ${desc}`.trim());
+    wrapped.code = "ETELEGRAM";
+    wrapped.response = err?.response;
+    throw wrapped;
+  }
 }
 
 async function sendImagesAsMediaGroups(
@@ -849,103 +872,63 @@ async function sendImagesAsMediaGroups(
   ct: CancelToken,
   mode: "doc" | "photo" = "doc",
 ): Promise<void> {
-  // Sanitize baseName for use in a filename: drop filesystem-illegal chars and
-  // truncate so the final filename stays comfortably short for HTTP headers.
   const safeBase = baseName
     .replace(/[\\/:*?"<>|\r\n\t]/g, "")
     .trim()
     .slice(0, 40) || "chapter";
 
-  const groupSize = 10;
-  const totalGroups = Math.ceil(imagePaths.length / groupSize);
+  const total = imagePaths.length;
 
-  // Process one group at a time: convert → send → delete temp files → next group.
-  // This keeps only ~10 images in RAM/disk at once instead of all images.
-  for (let g = 0; g < totalGroups; g++) {
+  // Send one image at a time — process → send → delete temp → next.
+  // Keeps memory flat regardless of chapter size.
+  for (let i = 0; i < total; i++) {
     ct.throwIfCancelled();
 
-    const start = g * groupSize;
-    const end = Math.min(start + groupSize, imagePaths.length);
-    const groupSourcePaths = imagePaths.slice(start, end);
-
-    // Build the temp files for just this group
-    const tempDir = path.join(os.tmpdir(), `mht_grp_${Date.now()}_${g}`);
-    fs.mkdirSync(tempDir, { recursive: true });
-    const groupFiles: string[] = [];
+    const srcPath = imagePaths[i]!;
+    let tmpPath: string | null = null;
 
     try {
-      if (mode === "doc") {
-        // DOCUMENTS — process 2 at a time (low concurrency = low memory)
-        const CONCURRENCY = 2;
-        const results = new Array<string>(groupSourcePaths.length);
-        for (let base = 0; base < groupSourcePaths.length; base += CONCURRENCY) {
-          ct.throwIfCancelled();
-          const chunk = groupSourcePaths.slice(base, base + CONCURRENCY);
-          const chunkPaths = await Promise.all(
-            chunk.map(async (srcPath, j) => {
-              const i = start + base + j;
-              const imgBuf = fs.readFileSync(srcPath);
-              const meta = await sharp(imgBuf).metadata().catch(() => ({ format: "jpeg" as const }));
-              let outBuf: Buffer;
-              if (meta.format === "jpeg" || meta.format === "jpg") {
-                outBuf = imgBuf;
-              } else {
-                outBuf = await sharp(imgBuf)
-                  .jpeg({ quality: 95, chromaSubsampling: "4:4:4" })
-                  .toBuffer();
-              }
-              const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
-              const tmpPath = path.join(tempDir, fileName);
-              fs.writeFileSync(tmpPath, outBuf);
-              return { idx: base + j, tmpPath };
-            })
-          );
-          for (const { idx, tmpPath } of chunkPaths) results[idx] = tmpPath;
-        }
-        groupFiles.push(...results.filter(Boolean));
-      } else {
-        // PHOTOS — compress 2 at a time
-        const CONCURRENCY = 2;
-        const results = new Array<string>(groupSourcePaths.length);
-        for (let base = 0; base < groupSourcePaths.length; base += CONCURRENCY) {
-          ct.throwIfCancelled();
-          const chunk = groupSourcePaths.slice(base, base + CONCURRENCY);
-          const chunkPaths = await Promise.all(
-            chunk.map(async (srcPath, j) => {
-              const imgBuf = fs.readFileSync(srcPath);
-              return { idx: base + j, path: await compressForTelegram(imgBuf) };
-            })
-          );
-          for (const { idx, path: p } of chunkPaths) results[idx] = p;
-        }
-        groupFiles.push(...results.filter(Boolean));
+      // Update status every 5 images so user sees progress
+      if (i % 5 === 0) {
+        bot.editMessageText(
+          `⏳ ပို့နေသည်... (${i + 1}/${total} ပုံ)`,
+          { chat_id: chatId, message_id: statusMsgId }
+        ).catch(() => {});
       }
 
-      // Update status every group so user sees real progress
-      bot.editMessageText(
-        `⏳ ပို့နေသည်... (${g + 1}/${totalGroups} အုပ်စု — ပုံ ${start + 1}–${end})`,
-        { chat_id: chatId, message_id: statusMsgId }
-      ).catch(() => { /* edit errors are harmless */ });
+      const imgBuf = fs.readFileSync(srcPath);
+
+      if (mode === "doc") {
+        const meta = await sharp(imgBuf).metadata().catch(() => ({ format: "jpeg" as const }));
+        let outBuf: Buffer;
+        if (meta.format === "jpeg" || meta.format === "jpg") {
+          outBuf = imgBuf;
+        } else {
+          outBuf = await sharp(imgBuf)
+            .jpeg({ quality: 95, chromaSubsampling: "4:4:4" })
+            .toBuffer();
+        }
+        const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
+        tmpPath = path.join(os.tmpdir(), `mht_doc_${Date.now()}_${i}.jpg`);
+        fs.writeFileSync(tmpPath, outBuf);
+      } else {
+        tmpPath = await compressForTelegram(imgBuf);
+      }
 
       let target = targetChat(chatId);
-
-      // Signal "uploading" to Telegram before sending — human-like behaviour
-      // that also suppresses some spam heuristics on Telegram's side.
       bot.sendChatAction(target as number, "upload_document").catch(() => {});
-
-      // Global throttle: space out sendMediaGroup calls across concurrent jobs.
       await tgThrottle();
 
+      const fileName = mode === "doc"
+        ? `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`
+        : undefined;
+
       try {
-        if (mode === "doc") {
-          await callWithRetry(() => sendDocumentGroupDirect(target as number, groupFiles), ct);
-        } else {
-          await callWithRetry(() => sendPhotoGroupDirect(target as number, groupFiles), ct);
-        }
+        await callWithRetry(() => sendSingleFileDirect(target as number, tmpPath!, mode, fileName), ct);
       } catch (err: any) {
         const desc: string = err?.response?.body?.description || err?.message || "";
 
-        // ── Supergroup migration: group was upgraded, auto-update stored ID ──────
+        // ── Supergroup migration ──────────────────────────────────────────────
         if (target !== chatId && isSuperGroupMigration(err)) {
           const newId = extractMigrateToChatId(err);
           if (newId) {
@@ -959,37 +942,31 @@ async function sendImagesAsMediaGroups(
               `📌 New ID: \`${newId}\`\n\nဆက်လက် ပို့နေပါသည်...`,
               { parse_mode: "Markdown" }
             ).catch(() => {});
-            // Retry with new supergroup ID
-            if (mode === "doc") {
-              await callWithRetry(() => sendDocumentGroupDirect(newId, groupFiles), ct);
-            } else {
-              await callWithRetry(() => sendPhotoGroupDirect(newId, groupFiles), ct);
-            }
+            await callWithRetry(() => sendSingleFileDirect(newId, tmpPath!, mode, fileName), ct);
           } else {
             throw err;
           }
-        // ── Chat not found / bot blocked: fallback to DM ─────────────────────────
-        } else if (target !== chatId && (desc.includes("chat not found") || desc.includes("bot was blocked") || desc.includes("CHAT_WRITE_FORBIDDEN") || desc.includes("not enough rights"))) {
+        // ── Chat not found / bot blocked: fallback to DM ─────────────────────
+        } else if (target !== chatId && (
+          desc.includes("chat not found") || desc.includes("bot was blocked") ||
+          desc.includes("CHAT_WRITE_FORBIDDEN") || desc.includes("not enough rights")
+        )) {
           logger.warn({ target, err: desc }, "Channel/group send failed, falling back to DM");
           await bot.sendMessage(chatId, `⚠️ Channel/Group သို့ ပို့၍မရပါ (${desc})။\nDM သို့သာ ပြောင်းပို့ပေးပါမည်။`);
-          if (mode === "doc") {
-            await callWithRetry(() => sendDocumentGroupDirect(chatId, groupFiles), ct);
-          } else {
-            await callWithRetry(() => sendPhotoGroupDirect(chatId, groupFiles), ct);
-          }
+          await callWithRetry(() => sendSingleFileDirect(chatId, tmpPath!, mode, fileName), ct);
         } else {
           throw err;
         }
       }
 
-      if (g < totalGroups - 1) {
-        // Jittered delay (900–1800 ms) between groups — avoids machine-like
-        // regularity that Telegram's anti-spam heuristics can detect.
-        await jitteredGroupDelay(ct);
+      // Small delay between images to avoid hitting Telegram rate limits
+      if (i < total - 1) {
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 300));
       }
     } finally {
-      // Clean up this group's temp files immediately after sending
-      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      if (tmpPath) {
+        try { fs.unlinkSync(tmpPath); } catch { }
+      }
     }
   }
 }
