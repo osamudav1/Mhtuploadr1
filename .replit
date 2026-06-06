@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-20", "web"]
 
 [[artifacts]]
 id = "artifacts/api-server"
@@ -40,7 +40,7 @@ args = "PORT=22053 BASE_PATH=/ pnpm --filter @workspace/bot-status run dev"
 waitForPort = 22053
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]
@@ -51,7 +51,6 @@ timeoutMs = 20000
 
 [userenv.shared]
 STORAGE_CHANNEL_ID = "-1003718574261"
-BOT_TOKEN = "8794826192:AAH2uFKkrGPqNGpEDVen2e8KPrpbfR2IlNw"
-TELEGRAM_BOT_TOKEN = "8794826192:AAH2uFKkrGPqNGpEDVen2e8KPrpbfR2IlNw"
-TELEGRAM_API_ID = "33432561"
-TELEGRAM_API_HASH = "2e38eed218b3ae0721f622272e2aad6d"
+
+[nix]
+channel = "stable-25_05"

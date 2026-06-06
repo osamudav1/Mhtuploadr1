@@ -72,6 +72,7 @@ onlyBuiltDependencies:
   - bufferutil
   - esbuild
   - msw
+  - sharp
   - unrs-resolver
   - utf-8-validate
 
@@ -159,3 +160,5 @@ overrides:
   # drizzle-kit uses esbuild internally on an older version that's vulnerable, this overrides it
   "@esbuild-kit/esm-loader": "npm:tsx@^4.21.0"
   esbuild: "0.27.3"
+  # es5-ext@0.10.64 is blocked by the Replit package firewall; pin to an older allowed version
+  es5-ext: "0.10.53"
