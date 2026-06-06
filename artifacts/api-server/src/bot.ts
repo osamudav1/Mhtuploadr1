@@ -509,13 +509,15 @@ interface ImagePart {
   sortKey: number;
 }
 
-async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promise<Buffer[]> {
+async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promise<{ paths: string[]; tempDir: string }> {
   const headerSlice = mhtContent.slice(0, 4096).toString("utf8");
   const boundaryMatch = headerSlice.match(/boundary=(?:"([^"]+)"|([^\s;\r\n]+))/i);
   if (!boundaryMatch) throw new Error("MIME boundary not found in .mht file");
   const boundary = (boundaryMatch[1] ?? boundaryMatch[2]).trim();
 
   logger.info({ boundary }, "Parsed MIME boundary");
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mht_"));
 
   const delim = Buffer.from("--" + boundary);
   const CRLF_CRLF = Buffer.from("\r\n\r\n");
@@ -530,9 +532,10 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
     pos = idx + delim.length;
   }
 
-  // ── Pass 1: decode all image parts (CPU-bound, fast) ─────────────────────
-  interface RawCandidate { buf: Buffer; location: string; }
-  const candidates: RawCandidate[] = [];
+  // ── Pass 1: decode each image part and write straight to disk ─────────────
+  // Never accumulate more than one decoded buffer in RAM at a time.
+  interface DiskCandidate { filePath: string; location: string; }
+  const candidates: DiskCandidate[] = [];
 
   for (let i = 0; i < positions.length; i++) {
     ct.throwIfCancelled();
@@ -563,7 +566,6 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
     try {
       let imgBuffer: Buffer;
       if (encoding === "base64") {
-        // Use latin1 + Buffer.from — avoids a full UTF-8 decode, ~2× faster
         const b64str = bodyBuf.toString("latin1").replace(/\s/g, "");
         if (b64str.length < 10) continue;
         imgBuffer = Buffer.from(b64str, "base64");
@@ -577,42 +579,43 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
       }
 
       if (imgBuffer.length < 200) continue;
-      candidates.push({ buf: imgBuffer, location });
+
+      // Write immediately to disk — release buffer from RAM after this line
+      const filePath = path.join(tempDir, `raw_${String(candidates.length).padStart(5, "0")}`);
+      fs.writeFileSync(filePath, imgBuffer);
+      candidates.push({ filePath, location });
     } catch (err) {
       logger.warn({ location, err: String(err) }, "Skipping image part (decode)");
     }
   }
 
-  // ── Pass 2: validate dimensions in parallel (I/O-bound via libvips) ──────
-  // Low concurrency keeps memory pressure down on free-tier hosts
-  const CONCURRENCY = 2;
-  const imageParts: ImagePart[] = [];
+  // ── Pass 2: validate dimensions from disk, one pair at a time ─────────────
+  interface ValidCandidate { filePath: string; location: string; sortKey: number; }
+  const valid: ValidCandidate[] = [];
 
-  for (let base = 0; base < candidates.length; base += CONCURRENCY) {
+  for (let i = 0; i < candidates.length; i++) {
     ct.throwIfCancelled();
-    const chunk = candidates.slice(base, base + CONCURRENCY);
-    const settled = await Promise.allSettled(
-      chunk.map(async ({ buf, location }) => {
-        const meta = await sharp(buf).metadata();
-        if (!meta.width || !meta.height) return null;
-        if (meta.width < 50 || meta.height < 50) return null;
-        const fnMatch = location.match(/\/(\d+)\.\w+(?:\?.*)?$/);
-        const sortKey = fnMatch ? parseInt(fnMatch[1], 10) : Infinity;
-        return { buffer: buf, location, sortKey } as ImagePart;
-      })
-    );
-    for (const r of settled) {
-      if (r.status === "fulfilled" && r.value) imageParts.push(r.value);
-      else if (r.status === "rejected") logger.warn({ err: String(r.reason) }, "Skipping image part (validate)");
+    const { filePath, location } = candidates[i]!;
+    try {
+      // Read just enough to get metadata — sharp streams internally
+      const meta = await sharp(filePath).metadata();
+      if (!meta.width || !meta.height) { fs.unlinkSync(filePath); continue; }
+      if (meta.width < 50 || meta.height < 50) { fs.unlinkSync(filePath); continue; }
+      const fnMatch = location.match(/\/(\d+)\.\w+(?:\?.*)?$/);
+      const sortKey = fnMatch ? parseInt(fnMatch[1], 10) : Infinity;
+      valid.push({ filePath, location, sortKey });
+    } catch {
+      logger.warn({ location }, "Skipping image part (validate)");
+      try { fs.unlinkSync(filePath); } catch { }
     }
   }
 
-  const numericParts = imageParts.filter(p => p.sortKey !== Infinity).sort((a, b) => a.sortKey - b.sortKey);
-  const nonNumericParts = imageParts.filter(p => p.sortKey === Infinity);
+  const numericParts = valid.filter(p => p.sortKey !== Infinity).sort((a, b) => a.sortKey - b.sortKey);
+  const nonNumericParts = valid.filter(p => p.sortKey === Infinity);
   const sorted = [...numericParts, ...nonNumericParts];
 
   logger.info({ total: sorted.length }, "MHT extraction complete");
-  return sorted.map(p => p.buffer);
+  return { paths: sorted.map(p => p.filePath), tempDir };
 }
 
 // ─── PDF → Images (pdftoppm) ──────────────────────────────────────────────────
@@ -1566,30 +1569,28 @@ bot.on("callback_query", async (query) => {
 
       const stopSpinner1 = startSpinner(chatId, messageId,
         f => `${f} "${fileName}"\nပုံများ ရှာဖွေနေသည်...`);
-      let images: Buffer[];
+      let extracted: { paths: string[]; tempDir: string };
       try {
-        images = await extractImagesFromMht(mhtBuffer, ct);
+        extracted = await extractImagesFromMht(mhtBuffer, ct);
       } finally {
         stopSpinner1();
       }
 
-      if (images.length === 0) {
+      if (extracted.paths.length === 0) {
+        try { fs.rmSync(extracted.tempDir, { recursive: true, force: true }); } catch { }
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
         finishJob(chatId, ct);
         return;
       }
 
-      // Write buffers to disk immediately to free RAM, then store paths in state
-      const { paths: imagePaths, tempDir: imgTempDir } = buffersToDisk(images);
-      (images as unknown as null[]).length = 0; // allow GC of buffer refs
-
-      // Save state and prompt the owner to mark images for deletion
+      // Images already on disk from extraction — store paths directly
       awaitingDeletion.set(chatId, {
-        imagePaths, tempDir: imgTempDir, baseName, fileName, statusMsgId: messageId, ct,
+        imagePaths: extracted.paths, tempDir: extracted.tempDir,
+        baseName, fileName, statusMsgId: messageId, ct,
       });
 
       await bot.editMessageText(
-        `📑 ပုံ ${imagePaths.length} ပုံ တွေ့ပြီ။\n\n` +
+        `📑 ပုံ ${extracted.paths.length} ပုံ တွေ့ပြီ။\n\n` +
         `❓ ဖျက်ချင်တဲ့ ပုံနံပါတ်ကို ရိုက်ပါ\n` +
         `ဥပမာ: \`3\`  သို့မဟုတ် \`1,3,5\`  သို့မဟုတ် \`2-7\`  သို့မဟုတ် \`1,3,5-10,15\`\n\n` +
         `ဖျက်စရာ မရှိရင် "⏭ Skip" ကို နှိပ်ပါ။`,
@@ -1637,23 +1638,20 @@ bot.on("callback_query", async (query) => {
 
       const stopSpinner2 = startSpinner(chatId, messageId,
         f => `${f} "${fileName}"\nပုံများ ရှာဖွေနေသည်...`);
-      let images: Buffer[];
+      let extracted2: { paths: string[]; tempDir: string };
       try {
-        images = await extractImagesFromMht(mhtBuffer, ct);
+        extracted2 = await extractImagesFromMht(mhtBuffer, ct);
       } finally {
         stopSpinner2();
       }
 
-      if (images.length === 0) {
+      if (extracted2.paths.length === 0) {
+        try { fs.rmSync(extracted2.tempDir, { recursive: true, force: true }); } catch { }
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
         return;
       }
 
-      const imageCount = images.length;
-      // Write to disk immediately to free RAM before sending
-      const { paths: imagePaths, tempDir: imgTempDir } = buffersToDisk(images);
-      (images as unknown as null[]).length = 0; // allow GC
-
+      const imageCount = extracted2.paths.length;
       const totalGroups = Math.ceil(imageCount / 10);
       await bot.editMessageText(
         `⏳ ပုံ ${imageCount} ပုံ တွေ့ပြီ။ ${totalGroups} အုပ်စုနဲ့ ပို့မည်...`,
@@ -1661,9 +1659,9 @@ bot.on("callback_query", async (query) => {
       );
 
       try {
-        await sendImagesAsMediaGroups(chatId, imagePaths, baseName, messageId, ct, sendMode);
+        await sendImagesAsMediaGroups(chatId, extracted2.paths, baseName, messageId, ct, sendMode);
       } finally {
-        try { fs.rmSync(imgTempDir, { recursive: true, force: true }); } catch { }
+        try { fs.rmSync(extracted2.tempDir, { recursive: true, force: true }); } catch { }
       }
       logger.info({ chatId, fileName, imageCount, sendMode }, "Images sent as media groups");
       const dest = channelActive()
