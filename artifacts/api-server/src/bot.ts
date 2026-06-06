@@ -424,6 +424,28 @@ async function callWithRetry<T>(
   throw lastErr ?? new Error("callWithRetry: exhausted attempts");
 }
 
+// ─── Global Telegram send throttle ────────────────────────────────────────────
+// Keeps outgoing sendMediaGroup calls ≥ 300 ms apart across all concurrent jobs
+// so we never fire multiple large uploads simultaneously into Telegram's servers.
+let _lastTgSendAt = 0;
+const _TG_MIN_GAP_MS = 300;
+
+async function tgThrottle(): Promise<void> {
+  const now = Date.now();
+  const gap = _lastTgSendAt + _TG_MIN_GAP_MS - now;
+  if (gap > 0) await new Promise(r => setTimeout(r, gap));
+  _lastTgSendAt = Date.now();
+}
+
+/** Jittered sleep between media groups: 900 ms base + 0–900 ms random */
+async function jitteredGroupDelay(ct: CancelToken): Promise<void> {
+  const ms = 900 + Math.floor(Math.random() * 900);
+  await new Promise<void>((res, rej) => {
+    const t = setTimeout(res, ms);
+    ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
+  }).finally(() => ct.unregisterChild());
+}
+
 // ─── Pending files (MHT choice keyboard) ─────────────────────────────────────
 
 interface PendingFile {
@@ -839,6 +861,14 @@ async function sendImagesAsMediaGroups(
       ).catch(() => { /* edit errors are harmless */ });
 
       let target = targetChat(chatId);
+
+      // Signal "uploading" to Telegram before sending — human-like behaviour
+      // that also suppresses some spam heuristics on Telegram's side.
+      bot.sendChatAction(target as number, "upload_document").catch(() => {});
+
+      // Global throttle: space out sendMediaGroup calls across concurrent jobs.
+      await tgThrottle();
+
       try {
         if (mode === "doc") {
           await callWithRetry(() => sendDocumentGroupDirect(target as number, groupFiles), ct);
@@ -886,11 +916,9 @@ async function sendImagesAsMediaGroups(
       }
 
       if (g < totalGroups - 1) {
-        // 1s delay between groups to stay under Telegram rate limits
-        await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, 1000);
-          ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
-        }).finally(() => ct.unregisterChild());
+        // Jittered delay (900–1800 ms) between groups — avoids machine-like
+        // regularity that Telegram's anti-spam heuristics can detect.
+        await jitteredGroupDelay(ct);
       }
     }
   } finally {
