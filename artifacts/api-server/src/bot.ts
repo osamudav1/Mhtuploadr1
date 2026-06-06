@@ -1383,8 +1383,14 @@ bot.on("document", async (msg) => {
       );
 
       await sendImagesAsMediaGroups(chatId, images, baseName, statusMsgId, ct);
-      await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
       logger.info({ chatId, fileName, pageCount: images.length }, "PDF pages sent as media groups");
+      const pdfDest = channelActive()
+        ? `📡 Channel (\`${STORAGE_CHANNEL_ID}\`)`
+        : `💬 DM သင့်ထံ`;
+      await bot.editMessageText(
+        `✅ စာမျက်နှာ ${images.length} မျက်နှာ (${totalGroups} အုပ်စု) ပို့ပြီးပါပြီ!\n📬 Destination: ${pdfDest}`,
+        { chat_id: chatId, message_id: statusMsgId, parse_mode: "Markdown" }
+      ).catch(() => {});
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: statusMsgId })
@@ -1618,8 +1624,14 @@ bot.on("callback_query", async (query) => {
       );
 
       await sendImagesAsMediaGroups(chatId, images, baseName, messageId, ct, sendMode);
-      await bot.deleteMessage(chatId, messageId).catch(() => {});
       logger.info({ chatId, fileName, imageCount: images.length, sendMode }, "Images sent as media groups");
+      const dest = channelActive()
+        ? `📡 Channel (\`${STORAGE_CHANNEL_ID}\`)`
+        : `💬 DM သင့်ထံ`;
+      await bot.editMessageText(
+        `✅ ပုံ ${images.length} ပုံ (${totalGroups} အုပ်စု) ပို့ပြီးပါပြီ!\n📬 Destination: ${dest}`,
+        { chat_id: chatId, message_id: messageId, parse_mode: "Markdown" }
+      ).catch(() => {});
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
