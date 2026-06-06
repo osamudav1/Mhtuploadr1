@@ -288,7 +288,8 @@ const activeJobs = new Map<number, CancelToken>();
 
 // ─── Awaiting deletion state (PDF flow) ───────────────────────────────────────
 interface AwaitingDeletion {
-  images: Buffer[];
+  imagePaths: string[];
+  tempDir: string;
   baseName: string;
   fileName: string;
   statusMsgId: number;
@@ -297,7 +298,23 @@ interface AwaitingDeletion {
 const awaitingDeletion = new Map<number, AwaitingDeletion>();
 
 function clearAwaitingDeletion(chatId: number) {
+  const state = awaitingDeletion.get(chatId);
+  if (state?.tempDir) {
+    try { fs.rmSync(state.tempDir, { recursive: true, force: true }); } catch { }
+  }
   awaitingDeletion.delete(chatId);
+}
+
+// ─── Write image buffers to disk immediately to free RAM ─────────────────────
+function buffersToDisk(images: Buffer[]): { paths: string[]; tempDir: string } {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mht_imgs_"));
+  const paths: string[] = [];
+  for (let i = 0; i < images.length; i++) {
+    const p = path.join(tempDir, `img_${String(i).padStart(5, "0")}.raw`);
+    fs.writeFileSync(p, images[i]!);
+    paths.push(p);
+  }
+  return { paths, tempDir };
 }
 
 function parseDeletionList(input: string, max: number): { keep: Set<number>; del: number[] } {
@@ -567,7 +584,8 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
   }
 
   // ── Pass 2: validate dimensions in parallel (I/O-bound via libvips) ──────
-  const CONCURRENCY = 6;
+  // Low concurrency keeps memory pressure down on free-tier hosts
+  const CONCURRENCY = 2;
   const imageParts: ImagePart[] = [];
 
   for (let base = 0; base < candidates.length; base += CONCURRENCY) {
@@ -599,7 +617,7 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
 
 // ─── PDF → Images (pdftoppm) ──────────────────────────────────────────────────
 
-async function extractImagesFromPdf(pdfBuffer: Buffer, ct: CancelToken): Promise<Buffer[]> {
+async function extractImagesFromPdf(pdfBuffer: Buffer, ct: CancelToken): Promise<{ paths: string[]; tempDir: string }> {
   ct.throwIfCancelled();
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pdf_"));
@@ -636,26 +654,28 @@ async function extractImagesFromPdf(pdfBuffer: Buffer, ct: CancelToken): Promise
 
     ct.throwIfCancelled();
 
-    const files = fs.readdirSync(tmpDir)
+    // Remove the input PDF to free disk space; keep the PNG pages
+    try { fs.unlinkSync(pdfPath); } catch { /* ignore */ }
+
+    const paths = fs.readdirSync(tmpDir)
       .filter(f => f.startsWith("page") && f.endsWith(".png"))
-      .sort();
+      .sort()
+      .map(f => path.join(tmpDir, f));
 
-    logger.info({ pageCount: files.length }, "PDF pages extracted");
+    logger.info({ pageCount: paths.length }, "PDF pages extracted");
 
-    const buffers: Buffer[] = [];
-    for (const file of files) {
-      ct.throwIfCancelled();
-      buffers.push(fs.readFileSync(path.join(tmpDir, file)));
-    }
-    return buffers;
-  } finally {
+    // Return paths without reading into memory — caller owns cleanup of tmpDir
+    return { paths, tempDir: tmpDir };
+  } catch (err) {
+    // Clean up on error only; on success the caller cleans up after sending
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw err;
   }
 }
 
 // ─── PDF creation ─────────────────────────────────────────────────────────────
 
-async function createPdfFromImages(images: Buffer[], ct: CancelToken): Promise<string> {
+async function createPdfFromImages(imagePaths: string[], ct: CancelToken): Promise<string> {
   const pdfPath = path.join(os.tmpdir(), `manga_${Date.now()}.pdf`);
   return new Promise(async (resolve, reject) => {
     try {
@@ -663,12 +683,14 @@ async function createPdfFromImages(images: Buffer[], ct: CancelToken): Promise<s
       const ws = fs.createWriteStream(pdfPath);
       doc.pipe(ws);
 
-      for (const imgBuffer of images) {
+      for (const imgPath of imagePaths) {
         ct.throwIfCancelled();
+        // Read one image at a time — released from RAM after each iteration
+        const imgBuffer = fs.readFileSync(imgPath);
         const meta = await sharp(imgBuffer).metadata();
         const w = meta.width ?? 595;
         const h = meta.height ?? 842;
-        const jpeg = await sharp(imgBuffer).jpeg({ quality: 90 }).toBuffer();
+        const jpeg = await sharp(imgBuffer).jpeg({ quality: 85 }).toBuffer();
         doc.addPage({ size: [w, h] });
         doc.image(jpeg, 0, 0, { width: w, height: h });
       }
@@ -818,18 +840,12 @@ function sendPhotoGroupDirect(chatId: number, filePaths: string[]): Promise<void
 
 async function sendImagesAsMediaGroups(
   chatId: number,
-  images: Buffer[],
+  imagePaths: string[],
   baseName: string,
   statusMsgId: number,
   ct: CancelToken,
   mode: "doc" | "photo" = "doc",
 ): Promise<void> {
-  const tempFiles: string[] = [];
-
-  // Unique scratch dir → lets each file have its full pretty display name on disk.
-  const tempDir = path.join(os.tmpdir(), `mht_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-  fs.mkdirSync(tempDir, { recursive: true });
-
   // Sanitize baseName for use in a filename: drop filesystem-illegal chars and
   // truncate so the final filename stays comfortably short for HTTP headers.
   const safeBase = baseName
@@ -837,61 +853,70 @@ async function sendImagesAsMediaGroups(
     .trim()
     .slice(0, 40) || "chapter";
 
-  try {
-    if (mode === "doc") {
-      // DOCUMENTS — Telegram does NOT recompress, text stays razor-sharp.
-      // Process all images in parallel (bounded to 4 at a time) for speed.
-      const CONCURRENCY = 4;
-      const results = new Array<string>(images.length);
-      for (let base = 0; base < images.length; base += CONCURRENCY) {
-        ct.throwIfCancelled();
-        const chunk = images.slice(base, base + CONCURRENCY);
-        const chunkPaths = await Promise.all(
-          chunk.map(async (imgBuf, j) => {
-            const i = base + j;
-            const meta = await sharp(imgBuf).metadata().catch(() => ({ format: "jpeg" as const }));
-            let outBuf: Buffer;
-            if (meta.format === "jpeg" || meta.format === "jpg") {
-              outBuf = imgBuf;
-            } else {
-              outBuf = await sharp(imgBuf)
-                .jpeg({ quality: 95, chromaSubsampling: "4:4:4" })
-                .toBuffer();
-            }
-            const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
-            const tmpPath = path.join(tempDir, fileName);
-            fs.writeFileSync(tmpPath, outBuf);
-            return { i, tmpPath };
-          })
-        );
-        for (const { i, tmpPath } of chunkPaths) results[i] = tmpPath;
+  const groupSize = 10;
+  const totalGroups = Math.ceil(imagePaths.length / groupSize);
+
+  // Process one group at a time: convert → send → delete temp files → next group.
+  // This keeps only ~10 images in RAM/disk at once instead of all images.
+  for (let g = 0; g < totalGroups; g++) {
+    ct.throwIfCancelled();
+
+    const start = g * groupSize;
+    const end = Math.min(start + groupSize, imagePaths.length);
+    const groupSourcePaths = imagePaths.slice(start, end);
+
+    // Build the temp files for just this group
+    const tempDir = path.join(os.tmpdir(), `mht_grp_${Date.now()}_${g}`);
+    fs.mkdirSync(tempDir, { recursive: true });
+    const groupFiles: string[] = [];
+
+    try {
+      if (mode === "doc") {
+        // DOCUMENTS — process 2 at a time (low concurrency = low memory)
+        const CONCURRENCY = 2;
+        const results = new Array<string>(groupSourcePaths.length);
+        for (let base = 0; base < groupSourcePaths.length; base += CONCURRENCY) {
+          ct.throwIfCancelled();
+          const chunk = groupSourcePaths.slice(base, base + CONCURRENCY);
+          const chunkPaths = await Promise.all(
+            chunk.map(async (srcPath, j) => {
+              const i = start + base + j;
+              const imgBuf = fs.readFileSync(srcPath);
+              const meta = await sharp(imgBuf).metadata().catch(() => ({ format: "jpeg" as const }));
+              let outBuf: Buffer;
+              if (meta.format === "jpeg" || meta.format === "jpg") {
+                outBuf = imgBuf;
+              } else {
+                outBuf = await sharp(imgBuf)
+                  .jpeg({ quality: 95, chromaSubsampling: "4:4:4" })
+                  .toBuffer();
+              }
+              const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
+              const tmpPath = path.join(tempDir, fileName);
+              fs.writeFileSync(tmpPath, outBuf);
+              return { idx: base + j, tmpPath };
+            })
+          );
+          for (const { idx, tmpPath } of chunkPaths) results[idx] = tmpPath;
+        }
+        groupFiles.push(...results.filter(Boolean));
+      } else {
+        // PHOTOS — compress 2 at a time
+        const CONCURRENCY = 2;
+        const results = new Array<string>(groupSourcePaths.length);
+        for (let base = 0; base < groupSourcePaths.length; base += CONCURRENCY) {
+          ct.throwIfCancelled();
+          const chunk = groupSourcePaths.slice(base, base + CONCURRENCY);
+          const chunkPaths = await Promise.all(
+            chunk.map(async (srcPath, j) => {
+              const imgBuf = fs.readFileSync(srcPath);
+              return { idx: base + j, path: await compressForTelegram(imgBuf) };
+            })
+          );
+          for (const { idx, path: p } of chunkPaths) results[idx] = p;
+        }
+        groupFiles.push(...results.filter(Boolean));
       }
-      tempFiles.push(...results);
-    } else {
-      // PHOTOS — compress to Telegram-friendly size (faster preview, smaller).
-      // Process in parallel, bounded to 4 at a time.
-      const CONCURRENCY = 4;
-      const results = new Array<string>(images.length);
-      for (let base = 0; base < images.length; base += CONCURRENCY) {
-        ct.throwIfCancelled();
-        const chunk = images.slice(base, base + CONCURRENCY);
-        const chunkPaths = await Promise.all(
-          chunk.map(async (imgBuf, j) => ({ i: base + j, path: await compressForTelegram(imgBuf) }))
-        );
-        for (const { i, path: p } of chunkPaths) results[i] = p;
-      }
-      tempFiles.push(...results);
-    }
-
-    const groupSize = 10;
-    const totalGroups = Math.ceil(images.length / groupSize);
-
-    for (let g = 0; g < totalGroups; g++) {
-      ct.throwIfCancelled();
-
-      const start = g * groupSize;
-      const end = Math.min(start + groupSize, images.length);
-      const groupFiles = tempFiles.slice(start, end);
 
       // Update status every group so user sees real progress
       bot.editMessageText(
@@ -959,12 +984,10 @@ async function sendImagesAsMediaGroups(
         // regularity that Telegram's anti-spam heuristics can detect.
         await jitteredGroupDelay(ct);
       }
+    } finally {
+      // Clean up this group's temp files immediately after sending
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
-  } finally {
-    for (const f of tempFiles) {
-      try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch { /* ignore */ }
-    }
-    try { fs.rmdirSync(tempDir); } catch { /* ignore */ }
   }
 }
 
@@ -975,13 +998,13 @@ async function finalizePdf(
   state: AwaitingDeletion,
   keptIndices: number[] | null, // null = keep all
 ): Promise<void> {
-  const { images, baseName, fileName, statusMsgId, ct } = state;
-  const finalImages = keptIndices === null ? images : keptIndices.map(i => images[i]!);
-  const removedCount = images.length - finalImages.length;
+  const { imagePaths, baseName, fileName, statusMsgId, ct } = state;
+  const finalPaths = keptIndices === null ? imagePaths : keptIndices.map(i => imagePaths[i]!);
+  const removedCount = imagePaths.length - finalPaths.length;
   let pdfPath: string | null = null;
 
   try {
-    if (finalImages.length === 0) {
+    if (finalPaths.length === 0) {
       await bot.editMessageText(`❌ ဖျက်ပြီးနောက် ပုံ မကျန်ပါ။ PDF လုပ်၍ မရပါ။`, {
         chat_id: chatId, message_id: statusMsgId,
       }).catch(() => {});
@@ -990,12 +1013,12 @@ async function finalizePdf(
 
     await bot.editMessageText(
       removedCount > 0
-        ? `⏳ ${removedCount} ပုံ ဖျက်ပြီး PDF ဖန်တီးနေသည် (ကျန် ${finalImages.length} ပုံ)...`
-        : `⏳ PDF ဖန်တီးနေသည် (${finalImages.length} ပုံ)...`,
+        ? `⏳ ${removedCount} ပုံ ဖျက်ပြီး PDF ဖန်တီးနေသည် (ကျန် ${finalPaths.length} ပုံ)...`
+        : `⏳ PDF ဖန်တီးနေသည် (${finalPaths.length} ပုံ)...`,
       { chat_id: chatId, message_id: statusMsgId }
     ).catch(() => {});
 
-    pdfPath = await createPdfFromImages(finalImages, ct);
+    pdfPath = await createPdfFromImages(finalPaths, ct);
 
     await callWithRetry(() =>
       bot.editMessageText(`⏳ PDF ပြုလုပ်ပြီ။ ပို့နေသည်...`, { chat_id: chatId, message_id: statusMsgId }), ct
@@ -1048,7 +1071,7 @@ async function finalizePdf(
     }
 
     await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
-    logger.info({ chatId, fileName, kept: finalImages.length, removed: removedCount }, "PDF sent");
+    logger.info({ chatId, fileName, kept: finalPaths.length, removed: removedCount }, "PDF sent");
   } catch (err) {
     if (err instanceof JobCancelledError) {
       bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: statusMsgId })
@@ -1367,28 +1390,33 @@ bot.on("document", async (msg) => {
         chat_id: chatId, message_id: statusMsgId,
       });
 
-      const images = await extractImagesFromPdf(pdfBuffer, ct);
+      const { paths: pdfImagePaths, tempDir: pdfImgTempDir } = await extractImagesFromPdf(pdfBuffer, ct);
 
-      if (images.length === 0) {
+      if (pdfImagePaths.length === 0) {
+        try { fs.rmSync(pdfImgTempDir, { recursive: true, force: true }); } catch { }
         await bot.editMessageText(`❌ PDF ထဲတွင် ပုံများ မတွေ့ပါ။`, {
           chat_id: chatId, message_id: statusMsgId,
         });
         return;
       }
 
-      const totalGroups = Math.ceil(images.length / 10);
+      const totalGroups = Math.ceil(pdfImagePaths.length / 10);
       await bot.editMessageText(
-        `⏳ စာမျက်နှာ ${images.length} မျက်နှာ တွေ့ပြီ။ ${totalGroups} အုပ်စုနဲ့ ပို့မည်...`,
+        `⏳ စာမျက်နှာ ${pdfImagePaths.length} မျက်နှာ တွေ့ပြီ။ ${totalGroups} အုပ်စုနဲ့ ပို့မည်...`,
         { chat_id: chatId, message_id: statusMsgId }
       );
 
-      await sendImagesAsMediaGroups(chatId, images, baseName, statusMsgId, ct);
-      logger.info({ chatId, fileName, pageCount: images.length }, "PDF pages sent as media groups");
+      try {
+        await sendImagesAsMediaGroups(chatId, pdfImagePaths, baseName, statusMsgId, ct);
+      } finally {
+        try { fs.rmSync(pdfImgTempDir, { recursive: true, force: true }); } catch { }
+      }
+      logger.info({ chatId, fileName, pageCount: pdfImagePaths.length }, "PDF pages sent as media groups");
       const pdfDest = channelActive()
         ? `📡 Channel (\`${STORAGE_CHANNEL_ID}\`)`
         : `💬 DM သင့်ထံ`;
       await bot.editMessageText(
-        `✅ စာမျက်နှာ ${images.length} မျက်နှာ (${totalGroups} အုပ်စု) ပို့ပြီးပါပြီ!\n📬 Destination: ${pdfDest}`,
+        `✅ စာမျက်နှာ ${pdfImagePaths.length} မျက်နှာ (${totalGroups} အုပ်စု) ပို့ပြီးပါပြီ!\n📬 Destination: ${pdfDest}`,
         { chat_id: chatId, message_id: statusMsgId, parse_mode: "Markdown" }
       ).catch(() => {});
     } catch (err) {
@@ -1551,13 +1579,17 @@ bot.on("callback_query", async (query) => {
         return;
       }
 
+      // Write buffers to disk immediately to free RAM, then store paths in state
+      const { paths: imagePaths, tempDir: imgTempDir } = buffersToDisk(images);
+      (images as unknown as null[]).length = 0; // allow GC of buffer refs
+
       // Save state and prompt the owner to mark images for deletion
       awaitingDeletion.set(chatId, {
-        images, baseName, fileName, statusMsgId: messageId, ct,
+        imagePaths, tempDir: imgTempDir, baseName, fileName, statusMsgId: messageId, ct,
       });
 
       await bot.editMessageText(
-        `📑 ပုံ ${images.length} ပုံ တွေ့ပြီ။\n\n` +
+        `📑 ပုံ ${imagePaths.length} ပုံ တွေ့ပြီ။\n\n` +
         `❓ ဖျက်ချင်တဲ့ ပုံနံပါတ်ကို ရိုက်ပါ\n` +
         `ဥပမာ: \`3\`  သို့မဟုတ် \`1,3,5\`  သို့မဟုတ် \`2-7\`  သို့မဟုတ် \`1,3,5-10,15\`\n\n` +
         `ဖျက်စရာ မရှိရင် "⏭ Skip" ကို နှိပ်ပါ။`,
@@ -1617,19 +1649,28 @@ bot.on("callback_query", async (query) => {
         return;
       }
 
-      const totalGroups = Math.ceil(images.length / 10);
+      const imageCount = images.length;
+      // Write to disk immediately to free RAM before sending
+      const { paths: imagePaths, tempDir: imgTempDir } = buffersToDisk(images);
+      (images as unknown as null[]).length = 0; // allow GC
+
+      const totalGroups = Math.ceil(imageCount / 10);
       await bot.editMessageText(
-        `⏳ ပုံ ${images.length} ပုံ တွေ့ပြီ။ ${totalGroups} အုပ်စုနဲ့ ပို့မည်...`,
+        `⏳ ပုံ ${imageCount} ပုံ တွေ့ပြီ။ ${totalGroups} အုပ်စုနဲ့ ပို့မည်...`,
         { chat_id: chatId, message_id: messageId }
       );
 
-      await sendImagesAsMediaGroups(chatId, images, baseName, messageId, ct, sendMode);
-      logger.info({ chatId, fileName, imageCount: images.length, sendMode }, "Images sent as media groups");
+      try {
+        await sendImagesAsMediaGroups(chatId, imagePaths, baseName, messageId, ct, sendMode);
+      } finally {
+        try { fs.rmSync(imgTempDir, { recursive: true, force: true }); } catch { }
+      }
+      logger.info({ chatId, fileName, imageCount, sendMode }, "Images sent as media groups");
       const dest = channelActive()
         ? `📡 Channel (\`${STORAGE_CHANNEL_ID}\`)`
         : `💬 DM သင့်ထံ`;
       await bot.editMessageText(
-        `✅ ပုံ ${images.length} ပုံ (${totalGroups} အုပ်စု) ပို့ပြီးပါပြီ!\n📬 Destination: ${dest}`,
+        `✅ ပုံ ${imageCount} ပုံ (${totalGroups} အုပ်စု) ပို့ပြီးပါပြီ!\n📬 Destination: ${dest}`,
         { chat_id: chatId, message_id: messageId, parse_mode: "Markdown" }
       ).catch(() => {});
     } catch (err) {
@@ -1674,11 +1715,11 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  const { keep, del } = parseDeletionList(text, state.images.length);
+  const { keep, del } = parseDeletionList(text, state.imagePaths.length);
   if (del.length === 0) {
     await bot.sendMessage(
       chatId,
-      `⚠️ ဖျက်စရာ ပုံ မရှိပါ (1 မှ ${state.images.length} အတွင်း ထည့်ပါ)။`
+      `⚠️ ဖျက်စရာ ပုံ မရှိပါ (1 မှ ${state.imagePaths.length} အတွင်း ထည့်ပါ)။`
     );
     return;
   }
