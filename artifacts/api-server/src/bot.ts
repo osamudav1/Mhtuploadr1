@@ -664,18 +664,15 @@ async function compressForTelegram(imgBuffer: Buffer): Promise<string> {
     return tmpPath;
   };
 
-  // High-quality JPEG encoder that preserves text sharpness on manga pages.
-  // mozjpeg + 4:4:4 chroma + trellis = much crisper text at same file size.
+  // Fast JPEG encoder — standard libjpeg is ~3-5x faster than mozjpeg/trellis
+  // while still producing excellent quality for manga text at quality ≥ 90.
   const encode = (input: Buffer, quality: number, width?: number): Promise<Buffer> => {
     let p = sharp(input);
     if (width) p = p.resize({ width, withoutEnlargement: true, kernel: "lanczos3" });
     return p
       .jpeg({
         quality,
-        mozjpeg: true,
         chromaSubsampling: "4:4:4",
-        trellisQuantisation: true,
-        progressive: true,
       })
       .toBuffer();
   };
@@ -782,34 +779,47 @@ async function sendImagesAsMediaGroups(
   try {
     if (mode === "doc") {
       // DOCUMENTS — Telegram does NOT recompress, text stays razor-sharp.
-      // The local Bot API server (TDLib) rejects WebP and some other formats
-      // when uploaded via multipart. Convert everything to JPEG at maximum
-      // quality so the image is accepted and text remains crisp.
-      for (let i = 0; i < images.length; i++) {
+      // Process all images in parallel (bounded to 4 at a time) for speed.
+      const CONCURRENCY = 4;
+      const results = new Array<string>(images.length);
+      for (let base = 0; base < images.length; base += CONCURRENCY) {
         ct.throwIfCancelled();
-        const meta = await sharp(images[i]).metadata().catch(() => ({ format: "jpeg" as const }));
-        let imgBuf: Buffer;
-        if (meta.format === "jpeg" || meta.format === "jpg") {
-          // Already JPEG — use as-is; no re-encode quality loss.
-          imgBuf = images[i];
-        } else {
-          // WebP / PNG / GIF / other → convert to high-quality JPEG.
-          imgBuf = await sharp(images[i])
-            .jpeg({ quality: 95, mozjpeg: true, chromaSubsampling: "4:4:4", trellisQuantisation: true })
-            .toBuffer();
-        }
-        const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
-        const tmpPath = path.join(tempDir, fileName);
-        fs.writeFileSync(tmpPath, imgBuf);
-        tempFiles.push(tmpPath);
+        const chunk = images.slice(base, base + CONCURRENCY);
+        const chunkPaths = await Promise.all(
+          chunk.map(async (imgBuf, j) => {
+            const i = base + j;
+            const meta = await sharp(imgBuf).metadata().catch(() => ({ format: "jpeg" as const }));
+            let outBuf: Buffer;
+            if (meta.format === "jpeg" || meta.format === "jpg") {
+              outBuf = imgBuf;
+            } else {
+              outBuf = await sharp(imgBuf)
+                .jpeg({ quality: 95, chromaSubsampling: "4:4:4" })
+                .toBuffer();
+            }
+            const fileName = `poto ${i + 1} - ${safeBase} - [ Manhwa by Luna ].jpg`;
+            const tmpPath = path.join(tempDir, fileName);
+            fs.writeFileSync(tmpPath, outBuf);
+            return { i, tmpPath };
+          })
+        );
+        for (const { i, tmpPath } of chunkPaths) results[i] = tmpPath;
       }
+      tempFiles.push(...results);
     } else {
       // PHOTOS — compress to Telegram-friendly size (faster preview, smaller).
-      for (let i = 0; i < images.length; i++) {
+      // Process in parallel, bounded to 4 at a time.
+      const CONCURRENCY = 4;
+      const results = new Array<string>(images.length);
+      for (let base = 0; base < images.length; base += CONCURRENCY) {
         ct.throwIfCancelled();
-        const compressedPath = await compressForTelegram(images[i]);
-        tempFiles.push(compressedPath);
+        const chunk = images.slice(base, base + CONCURRENCY);
+        const chunkPaths = await Promise.all(
+          chunk.map(async (imgBuf, j) => ({ i: base + j, path: await compressForTelegram(imgBuf) }))
+        );
+        for (const { i, path: p } of chunkPaths) results[i] = p;
       }
+      tempFiles.push(...results);
     }
 
     const groupSize = 10;
@@ -876,9 +886,9 @@ async function sendImagesAsMediaGroups(
       }
 
       if (g < totalGroups - 1) {
-        // 3s delay between groups to stay under Telegram rate limits
+        // 1s delay between groups to stay under Telegram rate limits
         await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, 3000);
+          const t = setTimeout(res, 1000);
           ct.registerChild(() => { clearTimeout(t); rej(new JobCancelledError()); });
         }).finally(() => ct.unregisterChild());
       }

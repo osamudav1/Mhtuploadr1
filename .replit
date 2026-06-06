@@ -69,7 +69,3 @@ STORAGE_CHANNEL_ID = "-1003718574261"
 
 [nix]
 channel = "stable-25_05"
-
-[[ports]]
-localPort = 5000
-externalPort = 80
