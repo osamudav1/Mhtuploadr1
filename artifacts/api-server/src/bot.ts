@@ -446,6 +446,27 @@ async function jitteredGroupDelay(ct: CancelToken): Promise<void> {
   }).finally(() => ct.unregisterChild());
 }
 
+// ─── Animated status message ───────────────────────────────────────────────────
+// Cycles through spinner frames every 1.5 s while a long operation runs.
+// Returns a stop() that clears the interval (call it in a finally block).
+const SPINNER_FRAMES = ['◐', '◓', '◑', '◒'];
+
+function startSpinner(
+  chatId: number,
+  messageId: number,
+  labelFn: (frame: string) => string,
+): () => void {
+  let idx = 0;
+  const iv = setInterval(() => {
+    idx = (idx + 1) % SPINNER_FRAMES.length;
+    bot.editMessageText(labelFn(SPINNER_FRAMES[idx]!), {
+      chat_id: chatId,
+      message_id: messageId,
+    }).catch(() => { /* ignore — message may have been replaced */ });
+  }, 1500);
+  return () => clearInterval(iv);
+}
+
 // ─── Pending files (MHT choice keyboard) ─────────────────────────────────────
 
 interface PendingFile {
@@ -492,7 +513,9 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
     pos = idx + delim.length;
   }
 
-  const imageParts: ImagePart[] = [];
+  // ── Pass 1: decode all image parts (CPU-bound, fast) ─────────────────────
+  interface RawCandidate { buf: Buffer; location: string; }
+  const candidates: RawCandidate[] = [];
 
   for (let i = 0; i < positions.length; i++) {
     ct.throwIfCancelled();
@@ -523,7 +546,8 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
     try {
       let imgBuffer: Buffer;
       if (encoding === "base64") {
-        const b64str = bodyBuf.toString("ascii").replace(/\s/g, "");
+        // Use latin1 + Buffer.from — avoids a full UTF-8 decode, ~2× faster
+        const b64str = bodyBuf.toString("latin1").replace(/\s/g, "");
         if (b64str.length < 10) continue;
         imgBuffer = Buffer.from(b64str, "base64");
       } else if (encoding === "quoted-printable") {
@@ -536,17 +560,32 @@ async function extractImagesFromMht(mhtContent: Buffer, ct: CancelToken): Promis
       }
 
       if (imgBuffer.length < 200) continue;
-
-      const meta = await sharp(imgBuffer).metadata();
-      if (!meta.width || !meta.height) continue;
-      if (meta.width < 50 || meta.height < 50) continue;
-
-      const fnMatch = location.match(/\/(\d+)\.\w+(?:\?.*)?$/);
-      const sortKey = fnMatch ? parseInt(fnMatch[1], 10) : Infinity;
-
-      imageParts.push({ buffer: imgBuffer, location, sortKey });
+      candidates.push({ buf: imgBuffer, location });
     } catch (err) {
-      logger.warn({ location, err: String(err) }, "Skipping image part");
+      logger.warn({ location, err: String(err) }, "Skipping image part (decode)");
+    }
+  }
+
+  // ── Pass 2: validate dimensions in parallel (I/O-bound via libvips) ──────
+  const CONCURRENCY = 6;
+  const imageParts: ImagePart[] = [];
+
+  for (let base = 0; base < candidates.length; base += CONCURRENCY) {
+    ct.throwIfCancelled();
+    const chunk = candidates.slice(base, base + CONCURRENCY);
+    const settled = await Promise.allSettled(
+      chunk.map(async ({ buf, location }) => {
+        const meta = await sharp(buf).metadata();
+        if (!meta.width || !meta.height) return null;
+        if (meta.width < 50 || meta.height < 50) return null;
+        const fnMatch = location.match(/\/(\d+)\.\w+(?:\?.*)?$/);
+        const sortKey = fnMatch ? parseInt(fnMatch[1], 10) : Infinity;
+        return { buffer: buf, location, sortKey } as ImagePart;
+      })
+    );
+    for (const r of settled) {
+      if (r.status === "fulfilled" && r.value) imageParts.push(r.value);
+      else if (r.status === "rejected") logger.warn({ err: String(r.reason) }, "Skipping image part (validate)");
     }
   }
 
@@ -1487,11 +1526,18 @@ bot.on("callback_query", async (query) => {
     try {
       const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct, origMsgId);
 
-      await bot.editMessageText(`⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
+      await bot.editMessageText(`◐ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
         chat_id: chatId, message_id: messageId,
       });
 
-      const images = await extractImagesFromMht(mhtBuffer, ct);
+      const stopSpinner1 = startSpinner(chatId, messageId,
+        f => `${f} "${fileName}"\nပုံများ ရှာဖွေနေသည်...`);
+      let images: Buffer[];
+      try {
+        images = await extractImagesFromMht(mhtBuffer, ct);
+      } finally {
+        stopSpinner1();
+      }
 
       if (images.length === 0) {
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
@@ -1547,11 +1593,18 @@ bot.on("callback_query", async (query) => {
     try {
       const mhtBuffer = await downloadFile(fileId, fileName, chatId, messageId, ct, origMsgId);
 
-      await bot.editMessageText(`⏳ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
+      await bot.editMessageText(`◐ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
         chat_id: chatId, message_id: messageId,
       });
 
-      const images = await extractImagesFromMht(mhtBuffer, ct);
+      const stopSpinner2 = startSpinner(chatId, messageId,
+        f => `${f} "${fileName}"\nပုံများ ရှာဖွေနေသည်...`);
+      let images: Buffer[];
+      try {
+        images = await extractImagesFromMht(mhtBuffer, ct);
+      } finally {
+        stopSpinner2();
+      }
 
       if (images.length === 0) {
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
