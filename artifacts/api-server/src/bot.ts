@@ -286,6 +286,43 @@ class CancelToken {
 // One active job per chatId
 const activeJobs = new Map<number, CancelToken>();
 
+// ─── File Queue (per chatId) ──────────────────────────────────────────────────
+interface QueuedFile {
+  fileId: string;
+  fileName: string;
+  origMessageId: number;
+}
+
+const fileQueue    = new Map<number, QueuedFile[]>(); // pending files
+const queueDraining = new Set<number>();              // chatIds with active drain loop
+const queueDoneCount = new Map<number, number>();     // files finished this drain batch
+const queueBatchSize = new Map<number, number>();     // total files in current batch
+
+function enqueueFile(chatId: number, file: QueuedFile): number {
+  const q = fileQueue.get(chatId) ?? [];
+  q.push(file);
+  fileQueue.set(chatId, q);
+  return q.length; // position in queue (1-based)
+}
+
+function dequeueFile(chatId: number): QueuedFile | undefined {
+  const q = fileQueue.get(chatId);
+  if (!q || q.length === 0) return undefined;
+  const item = q.shift()!;
+  if (q.length === 0) fileQueue.delete(chatId);
+  return item;
+}
+
+function queueLength(chatId: number): number {
+  return fileQueue.get(chatId)?.length ?? 0;
+}
+
+function clearQueue(chatId: number) {
+  fileQueue.delete(chatId);
+  queueDoneCount.delete(chatId);
+  queueBatchSize.delete(chatId);
+}
+
 // ─── Awaiting deletion state (PDF flow) ───────────────────────────────────────
 interface AwaitingDeletion {
   imagePaths: string[];
@@ -1070,6 +1107,117 @@ async function finalizePdf(
   }
 }
 
+// ─── Direct MHT→PDF (used by queue and send_pdf flow) ────────────────────────
+
+async function processMhtAsPdf(chatId: number, file: QueuedFile, statusMsgId: number, ct: CancelToken): Promise<void> {
+  const { fileId, fileName, origMessageId } = file;
+  const baseName = path.basename(fileName, path.extname(fileName));
+
+  const mhtBuffer = await downloadFile(fileId, fileName, chatId, statusMsgId, ct, origMessageId);
+
+  await bot.editMessageText(`◐ "${fileName}"\nပုံများ ရှာဖွေနေသည်...`, {
+    chat_id: chatId, message_id: statusMsgId,
+  });
+
+  const stopSpinner = startSpinner(chatId, statusMsgId,
+    f => `${f} "${fileName}"\nပုံများ ရှာဖွေနေသည်...`);
+  let extracted: { paths: string[]; tempDir: string };
+  try {
+    extracted = await extractImagesFromMht(mhtBuffer, ct);
+  } finally {
+    stopSpinner();
+  }
+
+  if (extracted.paths.length === 0) {
+    try { fs.rmSync(extracted.tempDir, { recursive: true, force: true }); } catch { }
+    await bot.editMessageText(`❌ "${fileName}" ထဲတွင် ပုံများ မတွေ့ပါ။`, {
+      chat_id: chatId, message_id: statusMsgId,
+    });
+    return;
+  }
+
+  await finalizePdf(chatId, {
+    imagePaths: extracted.paths,
+    tempDir: extracted.tempDir,
+    baseName, fileName, statusMsgId, ct,
+  }, null);
+}
+
+// ─── Drain the queue iteratively (stack-safe for large queues) ───────────────
+// Only one drain loop per chatId. Call drainQueue() after any job completes;
+// if a drain is already running it returns immediately (idempotent).
+
+async function drainQueue(chatId: number): Promise<void> {
+  if (queueDraining.has(chatId)) return; // already draining
+  if (queueLength(chatId) === 0) return; // nothing to do
+
+  queueDraining.add(chatId);
+
+  // Record batch totals for progress display
+  const batchTotal = queueLength(chatId);
+  queueBatchSize.set(chatId, batchTotal);
+  queueDoneCount.set(chatId, 0);
+
+  logger.info({ chatId, batchTotal }, "Queue drain started");
+
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const next = dequeueFile(chatId);
+      if (!next) break; // queue exhausted
+
+      const done     = (queueDoneCount.get(chatId) ?? 0) + 1;
+      const total    = queueBatchSize.get(chatId) ?? done;
+      const remaining = queueLength(chatId);
+      queueDoneCount.set(chatId, done);
+
+      const progressLine = total > 1
+        ? `📋 Queue [${done}/${total}] — ကျန် ${remaining} ဖိုင်`
+        : `📋 Queue — ကျန် ${remaining} ဖိုင်`;
+
+      const ct = startJob(chatId);
+      const statusMsg = await bot.sendMessage(
+        chatId,
+        `⏳ "${next.fileName}" PDF ပြောင်းနေသည်...\n${progressLine}`
+      );
+
+      try {
+        await processMhtAsPdf(chatId, next, statusMsg.message_id, ct);
+        // processMhtAsPdf calls finalizePdf which calls finishJob internally
+      } catch (err) {
+        if (err instanceof JobCancelledError) {
+          bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။ Queue ရပ်သည်။`,
+            { chat_id: chatId, message_id: statusMsg.message_id })
+            .catch(() => bot.sendMessage(chatId, "🛑 ဖျက်လိုက်ပြီ။ Queue ရပ်သည်။"));
+          clearQueue(chatId);
+          finishJob(chatId, ct);
+          break; // stop draining on cancel
+        } else {
+          // Non-fatal error: log, report, continue with next file
+          logger.error({ err, chatId, fileName: next.fileName }, "Queue PDF error");
+          const errMsg = err instanceof Error ? err.message : String(err);
+          bot.editMessageText(
+            `❌ "${next.fileName}"\n${errMsg.slice(0, 200)}\n\n▶ Queue ဆက်သွားသည်...`,
+            { chat_id: chatId, message_id: statusMsg.message_id }
+          ).catch(() => {});
+          finishJob(chatId, ct);
+        }
+      }
+    }
+
+    if ((queueDoneCount.get(chatId) ?? 0) > 0) {
+      const total = queueBatchSize.get(chatId) ?? 0;
+      bot.sendMessage(chatId, `✅ Queue ပြီးပါပြီ။ ဖိုင် ${total} ခု PDF ပြောင်းပြီးပါပြီ။`)
+        .catch(() => {});
+    }
+  } finally {
+    queueDraining.delete(chatId);
+    queueDoneCount.delete(chatId);
+    queueBatchSize.delete(chatId);
+    logger.info({ chatId }, "Queue drain finished");
+  }
+}
+
 // ─── Download helper ──────────────────────────────────────────────────────────
 
 async function downloadFile(
@@ -1191,11 +1339,50 @@ bot.onText(/\/cancel/, async (msg) => {
   const chatId = msg.chat.id;
   const wasRunning = cancelExistingJob(chatId);
   pendingFiles.delete(chatId);
-  if (wasRunning) {
-    bot.sendMessage(chatId, "🛑 လုပ်ဆောင်နေသော task ကို ဖျက်လိုက်ပြီ။");
+  const queuedCount = (fileQueue.get(chatId) ?? []).length;
+  clearQueue(chatId);
+  if (wasRunning || queuedCount > 0) {
+    const queueNote = queuedCount > 0 ? ` (Queue ${queuedCount} ဖိုင်ပါ ဖျက်လိုက်ပြီ)` : "";
+    bot.sendMessage(chatId, `🛑 လုပ်ဆောင်နေသော task ကို ဖျက်လိုက်ပြီ။${queueNote}`);
   } else {
     bot.sendMessage(chatId, "⚠️ ဖျက်စရာ task မရှိပါ။");
   }
+});
+
+// ─── /queue — show current queue status ──────────────────────────────────────
+bot.onText(/\/queue/, async (msg) => {
+  if (!isOwner(msg.from?.id)) return;
+  const chatId = msg.chat.id;
+  const q = fileQueue.get(chatId) ?? [];
+  const isRunning = activeJobs.has(chatId);
+  const isDraining = queueDraining.has(chatId);
+
+  if (q.length === 0 && !isRunning) {
+    bot.sendMessage(chatId, "📭 Queue ထဲတွင် ဖိုင်မရှိပါ။");
+    return;
+  }
+
+  const batchTotal = queueBatchSize.get(chatId) ?? q.length;
+  const done       = queueDoneCount.get(chatId) ?? 0;
+  const lines: string[] = [];
+
+  if (isRunning && isDraining) {
+    lines.push(`🔄 လုပ်ဆောင်နေသည် [${done}/${batchTotal}]`);
+  } else if (isRunning) {
+    lines.push(`🔄 ဖိုင်တစ်ခု လုပ်ဆောင်နေသည်`);
+  }
+
+  if (q.length > 0) {
+    lines.push(`📋 Queue တွင် ကျန် ${q.length} ဖိုင်:`);
+    q.slice(0, 20).forEach((f, i) => {
+      lines.push(`  ${done + i + 1}. ${f.fileName}`);
+    });
+    if (q.length > 20) lines.push(`  ... နှင့် နောက်ထပ် ${q.length - 20} ဖိုင်`);
+  } else {
+    lines.push(`📭 Queue ထဲတွင် ကျန်ဖိုင်မရှိ — job ပြီးဆုံးခါနီး`);
+  }
+
+  bot.sendMessage(chatId, lines.join("\n"));
 });
 
 // ─── /status — show server status ────────────────────────────────────────────
@@ -1424,7 +1611,16 @@ bot.on("document", async (msg) => {
     return;
   }
 
-  // Cancel any running job before showing the keyboard
+  // If a job is running, queue this file for auto-PDF instead of canceling
+  if (activeJobs.has(chatId)) {
+    const pos = enqueueFile(chatId, { fileId: document.file_id, fileName, origMessageId: msg.message_id });
+    await bot.sendMessage(chatId,
+      `📋 "${fileName}" → Queue #${pos} ထည့်လိုက်ပြီ။\nလက်ရှိ job ပြီးမှ PDF အဖြစ် ပြောင်းပို့မည်။`
+    );
+    return;
+  }
+
+  // No running job — show choice keyboard
   cancelExistingJob(chatId);
   pendingFiles.set(chatId, { fileId: document.file_id, fileName, timestamp: Date.now(), origMessageId: msg.message_id });
 
@@ -1493,7 +1689,7 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  // ── PDF deletion: Skip — keep all images and finalize ──────────────────────
+  // ── PDF deletion: Skip — keep all images and finalize (legacy keyboard) ─────
   if (action === "pdf_skip_delete") {
     const state = awaitingDeletion.get(chatId);
     if (!state) {
@@ -1503,14 +1699,18 @@ bot.on("callback_query", async (query) => {
       return;
     }
     await finalizePdf(chatId, state, null);
+    drainQueue(chatId).catch(e => logger.error({ e, chatId }, "Queue error"));
     return;
   }
 
   // ── PDF deletion: Cancel the whole PDF job ─────────────────────────────────
   if (action === "pdf_cancel_delete") {
     const wasRunning = cancelExistingJob(chatId);
+    const queuedCount = (fileQueue.get(chatId) ?? []).length;
+    clearQueue(chatId);
+    const queueNote = queuedCount > 0 ? ` Queue ${queuedCount} ဖိုင်ပါ ဖျက်လိုက်ပြီ။` : "";
     await bot.editMessageText(
-      wasRunning ? `🛑 PDF လုပ်ငန်း ဖျက်လိုက်ပြီ။` : `🛑 ဖျက်လိုက်ပြီ။`,
+      wasRunning ? `🛑 PDF လုပ်ငန်း ဖျက်လိုက်ပြီ။${queueNote}` : `🛑 ဖျက်လိုက်ပြီ။${queueNote}`,
       { chat_id: chatId, message_id: messageId }
     ).catch(() => {});
     return;
@@ -1557,33 +1757,16 @@ bot.on("callback_query", async (query) => {
         try { fs.rmSync(extracted.tempDir, { recursive: true, force: true }); } catch { }
         await bot.editMessageText(`❌ ဖိုင်ထဲတွင် ပုံများ မတွေ့ပါ။`, { chat_id: chatId, message_id: messageId });
         finishJob(chatId, ct);
+        drainQueue(chatId).catch(e => logger.error({ e, chatId }, "Queue error"));
         return;
       }
 
-      // Images already on disk from extraction — store paths directly
-      awaitingDeletion.set(chatId, {
+      // Directly convert to PDF — no deletion step
+      await finalizePdf(chatId, {
         imagePaths: extracted.paths, tempDir: extracted.tempDir,
         baseName, fileName, statusMsgId: messageId, ct,
-      });
-
-      await bot.editMessageText(
-        `pdf ပြောင်းရင် 📑 ပုံ ${extracted.paths.length} ပုံ တွေ့ပြီ။\n\n` +
-        `❓ ဖျက်ချင်တဲ့ ပုံနံပါတ်ကို ရိုက်ပါ\n` +
-        `ဥပမာ: 3  သို့မဟုတ် 1,3,5  သို့မဟုတ် 2-7  သို့မဟုတ် 1,3,5-10,15\n\n` +
-        `ဖျက်စရာ မရှိရင် "⏭ Skip" ကို နှိပ်ပါ။`,
-        {
-          chat_id: chatId, message_id: messageId,
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "⏭ Skip — အားလုံး PDF လုပ်မည်", callback_data: "pdf_skip_delete" }],
-              [{ text: "🛑 ဖျက်ပါ", callback_data: "pdf_cancel_delete" }],
-            ],
-          },
-        }
-      );
-      // NOTE: we keep the job alive (do NOT call finishJob). It will be
-      // finalized by finalizePdf() after the owner replies.
+      }, null);
+      drainQueue(chatId).catch(e => logger.error({ e, chatId }, "Queue error"));
     } catch (err) {
       if (err instanceof JobCancelledError) {
         bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။`, { chat_id: chatId, message_id: messageId })
@@ -1595,8 +1778,8 @@ bot.on("callback_query", async (query) => {
           { chat_id: chatId, message_id: messageId }
         ).catch(() => bot.sendMessage(chatId, "❌ ဖိုင် လုပ်ဆောင်ရာ အမှားဖြစ်သည်။"));
       }
-      clearAwaitingDeletion(chatId);
       finishJob(chatId, ct);
+      drainQueue(chatId).catch(e => logger.error({ e, chatId }, "Queue error"));
     }
 
   // ── MHT → Images ─────────────────────────────────────────────────────────────
@@ -1663,6 +1846,7 @@ bot.on("callback_query", async (query) => {
       }
     } finally {
       finishJob(chatId, ct);
+      drainQueue(chatId).catch(e => logger.error({ e, chatId }, "Queue error"));
     }
   }
 });
@@ -1705,6 +1889,7 @@ bot.on("message", async (msg) => {
   );
 
   await finalizePdf(chatId, state, [...keep].sort((a, b) => a - b));
+  drainQueue(chatId).catch(e => logger.error({ e, chatId }, "Queue error"));
 });
 
 bot.on("message", (msg) => {
