@@ -1567,9 +1567,9 @@ bot.on("callback_query", async (query) => {
       });
 
       await bot.editMessageText(
-        `📑 ပုံ ${extracted.paths.length} ပုံ တွေ့ပြီ။\n\n` +
+        `pdf ပြောင်းရင် 📑 ပုံ ${extracted.paths.length} ပုံ တွေ့ပြီ။\n\n` +
         `❓ ဖျက်ချင်တဲ့ ပုံနံပါတ်ကို ရိုက်ပါ\n` +
-        `ဥပမာ: \`3\`  သို့မဟုတ် \`1,3,5\`  သို့မဟုတ် \`2-7\`  သို့မဟုတ် \`1,3,5-10,15\`\n\n` +
+        `ဥပမာ: 3  သို့မဟုတ် 1,3,5  သို့မဟုတ် 2-7  သို့မဟုတ် 1,3,5-10,15\n\n` +
         `ဖျက်စရာ မရှိရင် "⏭ Skip" ကို နှိပ်ပါ။`,
         {
           chat_id: chatId, message_id: messageId,
