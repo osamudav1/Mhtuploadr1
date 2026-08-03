@@ -1183,7 +1183,7 @@ async function drainQueue(chatId: number): Promise<void> {
 
       try {
         await processMhtAsPdf(chatId, next, statusMsg.message_id, ct);
-        // processMhtAsPdf calls finalizePdf which calls finishJob internally
+        // processMhtAsPdf → finalizePdf → finishJob (all internal)
       } catch (err) {
         if (err instanceof JobCancelledError) {
           bot.editMessageText(`🛑 ဖျက်လိုက်ပြီ။ Queue ရပ်သည်။`,
@@ -1202,6 +1202,12 @@ async function drainQueue(chatId: number): Promise<void> {
           ).catch(() => {});
           finishJob(chatId, ct);
         }
+      }
+
+      // Brief pause between queue items — prevents bursting status messages
+      // into the per-chat 1 msg/sec Telegram limit when the queue is large.
+      if (queueLength(chatId) > 0) {
+        await new Promise(r => setTimeout(r, 1200));
       }
     }
 
